@@ -15,6 +15,8 @@ ARG GIT_COMMIT
 ENV GIT_COMMIT=$GIT_COMMIT
 ARG PR_NUMBER
 ENV PR_NUMBER=$PR_NUMBER
+ADD entrypoint.sh /
+RUN mkdir /certs
 
 # Fail-fast on OutOfMemoryError instead of letting the JVM limp on with
 # a depleted heap. The previous behaviour (no flag) caused the May 2026
