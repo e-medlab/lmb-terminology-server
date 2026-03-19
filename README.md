@@ -6,6 +6,12 @@ A FHIR-compliant terminology server for managing and serving healthcare terminol
 
 The application version is defined in the `VERSION` file in the project root; it is read by `build.gradle.kts` at build time and overrides `gradle.properties`.
 
+## Branch Image Tag
+
+For the `terminology-lt` branch, use the Docker image tag `latest-lt`.
+The full image name is: `ghcr.io/termx-health/termx-server:latest`.
+
+
 ## Features
 
 ### 🌐 FHIR Terminology Ecosystem Integration (New!)
@@ -38,19 +44,19 @@ Discover and resolve terminology servers across distributed healthcare systems.
 
 For complete feature documentation, see the [docs/features](docs/features) directory.
 
-## Init postgres docker 
+## Init postgres docker
 Or you can also use an existing database.
 
 Pull postgres public image.
-```bash 
+```bash
 docker pull postgres:14
 ```  
 Run Docker container
-```bash 
+```bash
 docker run -d --restart=unless-stopped --name termx-postgres -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres:14
-``` 
+```
 Connect and create database\users using the following command
-```bash 
+```bash
 docker exec -i termx-postgres psql -U postgres <<-EOSQL
 CREATE ROLE termserver_admin LOGIN PASSWORD 'test' NOSUPERUSER INHERIT NOCREATEDB CREATEROLE NOREPLICATION;
 CREATE ROLE termserver_app   LOGIN PASSWORD 'test' NOSUPERUSER INHERIT NOCREATEDB CREATEROLE NOREPLICATION;
@@ -63,7 +69,7 @@ EOSQL
 ```
 
 If you need to create a separate db for testing:
-```bash 
+```bash
 docker exec -i termx-postgres psql -U postgres <<-EOSQL
 CREATE DATABASE termserver_new WITH OWNER = termserver_admin ENCODING = 'UTF8' TABLESPACE = pg_default CONNECTION LIMIT = -1;
 grant temp on database termserver_new to termserver_app;
@@ -80,11 +86,11 @@ To target a different database name:
 ```
 In case you are using an existing database, run SQL commands between EOSQL via sql console.
 
-## Navigate to app folder and run application in the development mode 
-```bash 
+## Navigate to app folder and run application in the development mode
+```bash
 cd termx-app
 ./gradlew run -Pdev
-``` 
+```
 In the development mode you can use application without authentication. The application use special dev token **Bearer token** `yupi` in request Authorization header.
 
 ### Logging
@@ -118,17 +124,17 @@ It should return CapabilityStatement resource.
 ## Authentication
 
 ### Keyclock
-The terminology server requires authenticated users. Any authentication server supporting Open-Id connect should suffice. For our development, 
-we are using [Keycloak](https://www.keycloak.org/). Check official [docs](https://www.keycloak.org/guides#getting-started) for setup. 
+The terminology server requires authenticated users. Any authentication server supporting Open-Id connect should suffice. For our development,
+we are using [Keycloak](https://www.keycloak.org/). Check official [docs](https://www.keycloak.org/guides#getting-started) for setup.
 Check the [example](https://wiki.kodality.dev/terminology-server/guide/authentication#keycloak) of the configuration.
 
 ### Run application with authentication
-```bash 
+```bash
 ./gradlew run
 ```
 
-## Snowstorm 
-Snowstorm server serves SNOMED terminology and may be installed if you need SNOMED. 
+## Snowstorm
+Snowstorm server serves SNOMED terminology and may be installed if you need SNOMED.
 Check Snowstorm installation and configuration [documentation](https://wiki.kodality.dev/terminology-server/snowstorm).
 
 After installation add properties `snowstorm.url`, `snowstorm.user`, `snowstorm.password`, `snowstorm.namespace` to `application.yml` file.
