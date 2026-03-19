@@ -8,6 +8,9 @@ ENV APP_VERSION=${APP_VERSION:-latest}
 ARG BUILD_TIME
 ENV BUILD_TIME=$BUILD_TIME
 
+ADD entrypoint.sh /
+RUN mkdir /certs
+
 # Fail-fast on OutOfMemoryError instead of letting the JVM limp on with
 # a depleted heap. The previous behaviour (no flag) caused the May 2026
 # dev-server incident where a single OOM cascaded into every concurrent
