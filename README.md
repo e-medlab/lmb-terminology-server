@@ -9,7 +9,8 @@ The application version is defined in the `VERSION` file in the project root; it
 ## Branch Image Tag
 
 For the `terminology-lt` branch, use the Docker image tag `latest-lt`.
-The full image name is: `ghcr.io/termx-health/termx-server:latest`.
+The full image name is: 
+```ghcr.io/termx-health/termx-server:latest-lt```
 
 
 ## Features
