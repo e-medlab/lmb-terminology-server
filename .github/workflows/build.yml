@@ -111,8 +111,8 @@ jobs:
           echo "Base ref: ${{ github.base_ref }}"
 
       - name: Set latest tag
-        if: github.ref == 'refs/heads/terminology-lt'
-        run: echo "LATEST_TAG=latest-lt" >> $GITHUB_ENV
+        if: github.ref == 'refs/heads/main'
+        run: echo "LATEST_TAG=latest" >> $GITHUB_ENV
 
 
       - name: Build metadata
