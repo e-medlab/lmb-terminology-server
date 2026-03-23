@@ -1,6 +1,7 @@
-# TermX Server
+# Termx server app for Lithuania (LMB)
 
 A FHIR-compliant terminology server for managing and serving healthcare terminologies.
+
 
 ## Versioning
 
@@ -8,9 +9,13 @@ The application version is defined in the `VERSION` file in the project root; it
 
 ## Branch Image Tag
 
-For the `terminology-lt` branch, use the Docker image tag `latest-lt`.
-The full image name is: 
-```ghcr.io/termx-health/termx-server:latest-lt```
+This repository is a fork of `termx-server`.
+
+
+## Docker Image
+
+Use the Docker image:
+```ghcr.io/e-medlab/lmb-termx-server:latest```
 
 
 ## Features
