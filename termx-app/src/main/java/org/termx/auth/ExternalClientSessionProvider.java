@@ -20,7 +20,7 @@ public class ExternalClientSessionProvider extends SessionProvider {
 
   @Override
   public int getOrder() {
-    return 30;
+    return 25;
   }
 
   @Override
