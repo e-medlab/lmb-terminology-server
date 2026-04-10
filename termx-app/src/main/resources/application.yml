@@ -62,7 +62,7 @@ liquibase:
         app-username: ${datasources.default.username}
 auth:
   guest:
-    disabled: ${GUEST_DISABLED:false}
+    disabled: ${GUEST_DISABLED:true}
   privilege:
     mapper:
       store: disabled
