@@ -132,6 +132,13 @@ Authorization: Bearer yupi{"username":"qa","privileges":["*.CodeSystem.read"]}
 
 - **Local (verbose)**: Copy [`termx-app/src/main/resources/application-local.sample.yml`](termx-app/src/main/resources/application-local.sample.yml) to `termx-app/src/main/resources/application-local.yml` (that file is gitignored). The sample contains commented-out sections for every common dev override — logger levels, Bob/Minio, dev auth (yupi privileges), Snowstorm, SMTP, Postgres, SQL trace. Uncomment what you need. Micronaut only loads `application-local.yml` when the **`local`** environment is active. Use **`./gradlew :termx-app:run -Pdev`** or **`./scripts/run-backend.sh`** (they set `dev,local`), or add **`-Dmicronaut.environments=dev,local`** to the JVM when running from the IDE. **`./gradlew run` without `-Pdev` does not load `application-local.yml`**, so `logger.levels` there will have no effect.
 - **Docker**: Default root level is **INFO** unless overridden. Set **`LOGBACK_LOG_LEVEL`** (e.g. `DEBUG` for troubleshooting) or pass **`-DLOGBACK_LOG_LEVEL=...`** via **`JAVA_OPTS`**. For Docker Compose, add a line in [`deployment/docker-compose/server.env`](deployment/docker-compose/server.env).
+- **TermxUserProvider debug logs**: The logger for `org.termx.user.TermxUserProvider` is controlled via **`TERMX_USER_PROVIDER_LOG_LEVEL`** and defaults to **`DEBUG`**. This is useful when troubleshooting `/api/users` and the upstream `nsoft` `/info/users` call in containers. Example:
+
+```bash
+TERMX_USER_PROVIDER_LOG_LEVEL=DEBUG
+```
+
+Set it to `INFO`, `WARN`, or `ERROR` to reduce verbosity.
 
 ### Running automated tests
 
