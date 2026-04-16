@@ -27,3 +27,5 @@ application-*.yml
 !application-local.sample.yml
 CLAUDE.md
 .codex
+
+node_modules
