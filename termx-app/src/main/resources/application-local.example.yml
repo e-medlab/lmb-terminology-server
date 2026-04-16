@@ -6,4 +6,5 @@ logger:
   levels:
     root: DEBUG
     org.termx.terminology: DEBUG
+    org.termx.user.TermxUserProvider: DEBUG
     # optional: io.micronaut: INFO

@@ -1,0 +1,31 @@
+[
+  {
+    "id": 1001,
+    "firstname": "Admin",
+    "lastname": "Example",
+    "email": "admin@example.org",
+    "permissions": [
+      "*.*.*"
+    ]
+  },
+  {
+    "id": 1002,
+    "firstname": "Editor",
+    "lastname": "Example",
+    "email": "editor@example.org",
+    "permissions": [
+      "*.*.view",
+      "*.Task.edit",
+      "icd-10.CodeSystem.edit"
+    ]
+  },
+  {
+    "id": 1003,
+    "firstname": "Viewer",
+    "lastname": "Example",
+    "email": "viewer@example.org",
+    "permissions": [
+      "*.*.view"
+    ]
+  }
+]
