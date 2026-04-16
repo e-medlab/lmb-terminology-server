@@ -134,4 +134,5 @@ nsoft.url: https://dev.mnkv.nsoft.lt
 # Ensures Micronaut applies logger.levels from profile-specific files (e.g. application-local.yml).
 # Without a top-level "logger" entry, logger levels from local-only YAML may not be applied.
 logger:
-  levels: {}
+  levels:
+    org.termx.user.TermxUserProvider: ${TERMX_USER_PROVIDER_LOG_LEVEL:DEBUG}
