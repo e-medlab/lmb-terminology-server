@@ -1,9 +1,15 @@
 package org.termx.bob;
 
 
+import com.kodality.commons.exception.ApiClientException;
+import com.kodality.commons.model.Issue;
 import com.kodality.commons.model.QueryResult;
 import org.termx.bob.minio.MinioService;
 import io.micronaut.http.server.types.files.StreamedFile;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Optional;
 import jakarta.inject.Singleton;
 import lombok.RequiredArgsConstructor;
@@ -31,6 +37,14 @@ public class BobObjectService {
     return getMinio().retrieve(object);
   }
 
+  /**
+   * Raw {@link InputStream} for server-side consumers (re-uploading to Snowstorm, spooling
+   * to a temp file). Caller closes it.
+   */
+  public InputStream loadContentStream(BobObject object) {
+    return getMinio().retrieveStream(object);
+  }
+
 
   @Transactional
   public String store(BobObject object, byte[] content) {
@@ -38,6 +52,46 @@ public class BobObjectService {
     object.setId(id);
     persistContent(object, content);
     return objectRepository.getUuid(id);
+  }
+
+  /**
+   * Streaming variant: bytes from {@code filePath} flow to Minio without being buffered in
+   * the JVM heap. Use this for large uploads (SNOMED RF2, LOINC) — typically the controller
+   * has already spooled the multipart body to a temp file on disk and just passes the path.
+   */
+  @Transactional
+  public String store(BobObject object, Path filePath) {
+    Long id = objectRepository.create(object);
+    object.setId(id);
+    persistContent(object, filePath);
+    return objectRepository.getUuid(id);
+  }
+
+  private void persistContent(BobObject object, Path filePath) {
+    BobStorage storage = object.getStorage();
+    prepareTypeAndPath(storage);
+    try (InputStream in = Files.newInputStream(filePath)) {
+      long size = Files.size(filePath);
+      getMinio().store(object, in, size);
+    } catch (IOException e) {
+      throw new RuntimeException("Failed to stream file '" + filePath + "' to Minio: " + e.getMessage(), e);
+    }
+    Long storageId = objectRepository.createStorage(object.getId(), storage);
+    storage.setId(storageId);
+  }
+
+  @Transactional
+  public BobObject update(String uuid, BobObject patch) {
+    BobObject existing = load(uuid);
+    if (existing == null) {
+      throw new RuntimeException("BobObject not found: " + uuid);
+    }
+    BobObject merged = new BobObject()
+        .setId(existing.getId())
+        .setMeta(patch.getMeta() != null ? patch.getMeta() : existing.getMeta())
+        .setDescription(patch.getDescription() != null ? patch.getDescription() : existing.getDescription());
+    objectRepository.update(existing.getId(), merged);
+    return load(uuid);
   }
 
   @Transactional
@@ -74,6 +128,13 @@ public class BobObjectService {
   }
 
   private MinioService getMinio() {
-    return minioService.orElseThrow(() -> new RuntimeException("minio is not configured"));
+    // ApiClientException so the framework's DefaultExceptionHandler returns a structured 400
+    // with our code instead of a generic XX100 System error. The message tells operators what
+    // to do — local dev forgets scripts/run-minio.sh frequently, prod deploys forget MINIO_URL.
+    return minioService.orElseThrow(() -> new ApiClientException(Issue.error(
+        "BOB101",
+        "Object storage (Minio) is not configured. " +
+            "Local dev: run scripts/run-minio.sh. " +
+            "Production: set MINIO_URL / MINIO_ACCESS_KEY / MINIO_SECRET_KEY env vars.")));
   }
 }

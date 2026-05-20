@@ -20,6 +20,7 @@ public class SnomedRF2UploadCacheRepository extends BaseRepository {
     ssb.property("filename", upload.getFilename());
     ssb.property("zip_size", upload.getZipSize());
     ssb.property("zip_data", upload.getZipData());
+    ssb.property("bob_object_uuid", upload.getBobObjectUuid());
     ssb.property("scan_lorque_id", upload.getScanLorqueId());
     ssb.property("imported", upload.isImported());
     ssb.property("started", upload.getStarted());
@@ -44,10 +45,30 @@ public class SnomedRF2UploadCacheRepository extends BaseRepository {
     jdbcTemplate.update(sql, lorqueId, id);
   }
 
+  /**
+   * Most-recent scan lorqueId for a given Bob archive uuid, or {@code null} if no scan has
+   * been recorded yet. Backs {@code GET /snomed/archives/{uuid}/latest-scan-result} — the
+   * archive-detail / scan-result pages used to rely on Angular router state to carry the
+   * envelope across navigations, but that's brittle (state is per-history-entry and lost on
+   * refresh / back-forward cache restore), so the client now fetches by archive uuid
+   * server-side and we just need to know which lorque process produced the latest result.
+   */
+  public Long findLatestScanLorqueIdByBobObjectUuid(String bobObjectUuid) {
+    String sql = "select scan_lorque_id from sys.snomed_rf2_upload "
+        + "where sys_status = 'A' and bob_object_uuid = ? and scan_lorque_id is not null "
+        + "order by started desc limit 1";
+    try {
+      return jdbcTemplate.queryForObject(sql, Long.class, bobObjectUuid);
+    } catch (org.springframework.dao.EmptyResultDataAccessException e) {
+      return null;
+    }
+  }
+
   public void cleanup(int daysOld) {
     // Soft-delete and clear zip_data: the schema GRANTs in sys-schema.xml don't include DELETE
     // for the app user, and what we actually need is to reclaim the bytea (which can be hundreds
     // of MB per row). The empty-string assignment lets PostgreSQL release the TOAST chunks.
+    // bob-archive rows have zip_data IS NULL — that's fine, the update is a no-op there.
     String sql = "update sys.snomed_rf2_upload set sys_status = 'C', zip_data = ''::bytea "
         + "where sys_status = 'A' and started < current_timestamp - (? || ' days')::interval";
     jdbcTemplate.update(sql, String.valueOf(daysOld));

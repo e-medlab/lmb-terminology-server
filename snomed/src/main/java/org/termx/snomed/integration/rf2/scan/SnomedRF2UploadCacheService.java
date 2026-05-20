@@ -32,6 +32,25 @@ public class SnomedRF2UploadCacheService {
     return upload;
   }
 
+  /**
+   * Bob-archive variant: records the cache entry with {@code bobObjectUuid} populated and
+   * {@code zipData=null}. The "Proceed with import" path then re-streams from Bob → Snowstorm.
+   */
+  @Transactional
+  public SnomedRF2Upload saveBobArchive(SnomedImportRequest request, String filename, String bobObjectUuid, long zipSize) {
+    SnomedRF2Upload upload = new SnomedRF2Upload()
+        .setBranchPath(request.getBranchPath())
+        .setRf2Type(request.getType())
+        .setCreateCodeSystemVersion(request.isCreateCodeSystemVersion())
+        .setFilename(filename)
+        .setZipSize(zipSize)
+        .setBobObjectUuid(bobObjectUuid)
+        .setImported(false)
+        .setStarted(OffsetDateTime.now());
+    upload.setId(repository.save(upload));
+    return upload;
+  }
+
   @Transactional
   public void attachLorqueId(Long uploadId, Long lorqueId) {
     repository.setScanLorqueId(uploadId, lorqueId);
@@ -39,6 +58,15 @@ public class SnomedRF2UploadCacheService {
 
   public SnomedRF2Upload load(Long id) {
     return repository.load(id);
+  }
+
+  /**
+   * Latest scan lorqueId for a Bob archive uuid, or {@code null} if no scan has been
+   * recorded. Drives {@code GET /snomed/archives/{uuid}/latest-scan-result} on the
+   * controller — same-URL → same-data semantics for the scan-result page.
+   */
+  public Long findLatestScanLorqueIdByBobObjectUuid(String bobObjectUuid) {
+    return repository.findLatestScanLorqueIdByBobObjectUuid(bobObjectUuid);
   }
 
   @Transactional

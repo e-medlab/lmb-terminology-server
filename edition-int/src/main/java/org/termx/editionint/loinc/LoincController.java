@@ -5,13 +5,19 @@ import org.termx.core.auth.Authorized;
 import org.termx.core.sys.job.logger.ImportLogger;
 import org.termx.core.utils.FileUtil;
 import org.termx.editionint.Privilege;
+import org.termx.editionint.loinc.utils.LoincArchiveContents;
+import org.termx.editionint.loinc.utils.LoincImportFromArchiveRequest;
 import org.termx.editionint.loinc.utils.LoincImportRequest;
 import org.termx.sys.job.JobLogResponse;
 import io.micronaut.core.annotation.Nullable;
 import io.micronaut.http.MediaType;
+import io.micronaut.http.annotation.Body;
 import io.micronaut.http.annotation.Controller;
+import io.micronaut.http.annotation.Get;
+import io.micronaut.http.annotation.PathVariable;
 import io.micronaut.http.annotation.Part;
 import io.micronaut.http.annotation.Post;
+import io.micronaut.http.annotation.QueryValue;
 import io.micronaut.http.multipart.CompletedFileUpload;
 import io.reactivex.rxjava3.core.Flowable;
 import java.util.List;
@@ -29,6 +35,7 @@ public class LoincController {
 
   private final LoincService loincService;
   private final ImportLogger importLogger;
+  private final LoincImportFromArchiveService loincImportFromArchiveService;
 
   @Authorized(Privilege.CS_WRITE)
   @Post(value = "/import", consumes = MediaType.MULTIPART_FORM_DATA)
@@ -55,6 +62,32 @@ public class LoincController {
 
     Map<String, Object> params = Map.of("request", req, "files", files);
     return importLogger.runJob(JOB_TYPE, params, loincService::importLoinc);
+  }
+
+  /**
+   * Streaming counterpart of {@link #process}: the LOINC release zip already lives in the
+   * {@code "loinc"} Bob container (uploaded via {@code POST /bob/objects?container=loinc}). The
+   * server spools it to a local temp file, unpacks the eight known CSVs by basename, and feeds
+   * the existing {@link LoincService#importLoinc} pipeline as an async {@code ImportLogger}
+   * job. The browser never has to re-upload a multi-hundred-MB release for retries.
+   */
+  @Authorized(Privilege.CS_WRITE)
+  @Post(value = "/import/from-archive")
+  public JobLogResponse processFromArchive(@Body LoincImportFromArchiveRequest request) {
+    return loincImportFromArchiveService.startImport(request);
+  }
+
+  /**
+   * Lists every {@code .csv} entry inside a Bob-stored LOINC archive plus the slot the
+   * auto-dispatch would assign each one. Drives the per-slot select boxes on the import
+   * page — admins see what's in the chosen zip, the recommended mapping is preselected,
+   * and they can override before clicking Import.
+   */
+  @Authorized(Privilege.CS_WRITE)
+  @Get(value = "/archives/{uuid}/files")
+  public LoincArchiveContents listArchiveFiles(@PathVariable String uuid,
+                                               @Nullable @QueryValue String language) {
+    return loincImportFromArchiveService.listArchiveContents(uuid, language);
   }
 
   private static byte[] getBytes(Publisher<CompletedFileUpload> file) {

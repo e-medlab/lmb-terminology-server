@@ -24,8 +24,12 @@ import org.termx.snomed.refset.SnomedRefsetResponse;
 import org.termx.snomed.refset.SnomedRefsetSearchParams;
 import org.termx.snomed.rf2.SnomedExportJob;
 import org.termx.snomed.rf2.SnomedExportRequest;
+import org.termx.snomed.rf2.SnomedImportFromArchiveRequest;
 import org.termx.snomed.rf2.SnomedImportJob;
 import org.termx.snomed.rf2.SnomedImportRequest;
+import org.termx.bob.BobObject;
+import org.termx.snomed.rf2.SnomedDeltaCalculateRequest;
+import org.termx.snomed.rf2.SnomedRF2FileStats;
 import org.termx.snomed.rf2.SnomedRF2Upload;
 import org.termx.snomed.rf2.scan.SnomedRF2ScanEnvelope;
 import org.termx.snomed.concept.SnomedConceptUsage;
@@ -86,6 +90,9 @@ public class SnomedController {
   private final SnomedRF2ScanService snomedRF2ScanService;
   private final SnomedRF2UploadCacheService snomedRF2UploadCacheService;
   private final SnomedConceptUsageService snomedConceptUsageService;
+  private final SnomedRF2ImportFromArchiveService snomedRF2ImportFromArchiveService;
+  private final SnomedRF2ArchiveStatsService snomedRF2ArchiveStatsService;
+  private final SnomedDeltaCalculateService snomedDeltaCalculateService;
 
 
   //----------------CodeSystems----------------
@@ -266,6 +273,66 @@ public class SnomedController {
     return snomedRF2ScanService.scanRF2(req, importFile, filename);
   }
 
+  /**
+   * Streaming counterpart of {@link #createImportJob}: the archive already lives in the
+   * {@code "snomed"} Bob container (uploaded via {@code POST /bob/objects?container=snomed}),
+   * so we never buffer the zip in JVM heap. Runs asynchronously via Lorque; the response is
+   * a process the UI can poll.
+   */
+  @Authorized(Privilege.SNOMED_WRITE)
+  @Post(value = "/imports/from-archive")
+  public LorqueProcess createImportJobFromArchive(@Body SnomedImportFromArchiveRequest request) {
+    return snomedRF2ImportFromArchiveService.startImport(request);
+  }
+
+  /**
+   * Streaming counterpart of {@link #scanImport}: the archive already lives in the
+   * {@code "snomed"} Bob container, so re-running a dry-run scan does not require re-upload.
+   */
+  @Authorized(Privilege.SNOMED_READ)
+  @Post(value = "/imports/scan/from-archive")
+  public LorqueProcess scanImportFromArchive(@Body SnomedImportFromArchiveRequest request) {
+    return snomedRF2ImportFromArchiveService.startScan(request);
+  }
+
+  /**
+   * Per-file row counts for a SNOMED RF2 archive stored in Bob. Feeds the "Files" panel of
+   * the archive detail page (Phase 2a). Streams the archive from Minio through a single
+   * {@link java.util.zip.ZipInputStream} pass; entries whose data-row count is &lt;= 0
+   * (header-only / empty) are filtered out.
+   */
+  @Authorized(Privilege.SNOMED_READ)
+  @Get("/archives/{uuid}/file-stats")
+  public SnomedRF2FileStats archiveFileStats(@PathVariable String uuid) {
+    return snomedRF2ArchiveStatsService.compute(uuid);
+  }
+
+  /**
+   * Peers eligible as a baseline in the archive detail page's "Diff" section: other archives
+   * in the {@code "snomed"} container with the same {@code meta.branchPath} as {@code uuid},
+   * excluding {@code uuid} itself and any delta archives. Read-only and cheap.
+   */
+  @Authorized(Privilege.SNOMED_READ)
+  @Get("/archives/{uuid}/diff-candidates")
+  public List<BobObject> archiveDiffCandidates(@PathVariable String uuid) {
+    return snomedDeltaCalculateService.findDiffCandidates(uuid);
+  }
+
+  /**
+   * Kick off a delta calculation between the path archive (new) and the body's
+   * {@code baselineUuid} (old). Returns the {@link LorqueProcess} the UI polls; on completion
+   * the process result text is JSON {@code {deltaUuid, rowsExported, durationMs, latestState}}
+   * — the UI navigates to the produced delta's detail page using {@code deltaUuid}.
+   *
+   * <p>Async because the IHTSDO tool can take several minutes on full editions; the
+   * subprocess uses up to 4 GB of its own JVM heap (the application JVM is unaffected).</p>
+   */
+  @Authorized(Privilege.SNOMED_WRITE)
+  @Post("/archives/{uuid}/delta")
+  public LorqueProcess calculateArchiveDelta(@PathVariable String uuid, @Body SnomedDeltaCalculateRequest request) {
+    return snomedDeltaCalculateService.startDeltaCalculation(uuid, request);
+  }
+
   @Authorized(Privilege.SNOMED_WRITE)
   @Post("/imports/scan/{cacheId}/proceed")
   public Map<String, String> proceedScanImport(@PathVariable Long cacheId) {
@@ -277,7 +344,17 @@ public class SnomedController {
     req.setBranchPath(cached.getBranchPath());
     req.setType(cached.getRf2Type());
     req.setCreateCodeSystemVersion(cached.isCreateCodeSystemVersion());
-    Map<String, String> result = snomedService.importRF2File(req, cached.getZipData());
+    // Two storage paths share this endpoint:
+    //   • legacy /imports/scan upload → cached.zipData is populated → byte[] import
+    //   • new /imports/scan/from-archive → cached.bobObjectUuid is set, zipData is NULL →
+    //     re-stream Bob → Snowstorm without re-buffering. This is what makes the dry-run →
+    //     proceed flow heap-safe on full International editions.
+    Map<String, String> result;
+    if (cached.getBobObjectUuid() != null) {
+      result = snomedService.importRF2FileFromBob(req, cached.getBobObjectUuid());
+    } else {
+      result = snomedService.importRF2File(req, cached.getZipData());
+    }
     snomedRF2UploadCacheService.markImported(cacheId);
     return result;
   }
@@ -297,6 +374,27 @@ public class SnomedController {
     }
     String json = new String(process.getResult(), java.nio.charset.StandardCharsets.UTF_8);
     return JsonUtil.fromJson(json, SnomedRF2ScanEnvelope.class);
+  }
+
+  /**
+   * Most-recent scan envelope for a Bob archive, keyed by Bob uuid (the path) rather than by
+   * lorqueId. The archive-detail / scan-result Angular pages used to carry the envelope
+   * across navigations via router state, but that's per-history-entry and lost on refresh /
+   * back-forward cache restore — so two different archive URLs could end up showing whichever
+   * envelope was still cached in router state. With this endpoint the client fetches fresh
+   * by archive uuid every time and same URL always returns same data.
+   *
+   * <p>Returns {@code null} (HTTP 200 with empty body) when no scan has been recorded yet for
+   * this archive — the client treats that as "click Analyze on the archive page".</p>
+   */
+  @Authorized(Privilege.SNOMED_READ)
+  @Get("/archives/{uuid}/latest-scan-result")
+  public SnomedRF2ScanEnvelope latestScanResult(@PathVariable String uuid) {
+    Long lorqueId = snomedRF2UploadCacheService.findLatestScanLorqueIdByBobObjectUuid(uuid);
+    if (lorqueId == null) {
+      return null;
+    }
+    return loadScanResult(lorqueId);
   }
 
   @Authorized(Privilege.SNOMED_READ)

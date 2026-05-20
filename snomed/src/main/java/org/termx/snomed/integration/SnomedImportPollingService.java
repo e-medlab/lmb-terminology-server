@@ -70,7 +70,17 @@ public class SnomedImportPollingService {
         tracking.setFinished(OffsetDateTime.now());
         tracking.setErrorMessage(snowstormJob.getErrorMessage());
         tracking.setNotified(true);
-        
+
+        // Append the terminal-status line to the lifecycle log surfaced in the email.
+        if (tracking.getDetails() == null) {
+          tracking.setDetails(new java.util.ArrayList<>());
+        }
+        Duration processed = Duration.between(tracking.getStarted(), tracking.getFinished());
+        tracking.getDetails().add(String.format(
+            "Snowstorm reported status %s after %s",
+            currentStatus, formatDuration(processed)));
+        log.info("snomed-rf2-import: {}", tracking.getDetails().getLast());
+
         trackingRepository.save(tracking);
         
         long start = System.currentTimeMillis();
@@ -90,11 +100,56 @@ public class SnomedImportPollingService {
     try {
       String subject = buildSubject(tracking, snowstormJob);
       String htmlBody = buildHtmlBody(tracking, snowstormJob);
-      
+
       List<String> recipients = emailService.getImportRecipients();
       emailService.sendToMultiple(recipients, subject, htmlBody, true);
     } catch (Exception e) {
       log.error("Failed to send SNOMED import notification", e);
+    }
+  }
+
+  /**
+   * Notify recipients of an upload-stage SNOMED import failure — used by
+   * {@link SnomedRF2ImportFromArchiveService} (and the legacy {@link SnomedService} paths)
+   * when the import errors out BEFORE the file reaches Snowstorm, so no
+   * {@link SnomedImportTracking} row gets persisted and the regular {@link
+   * #pollPendingImports()} sweep can't pick it up. Reuses this service's HTML scaffold
+   * for consistency with the post-Snowstorm completion email — same subject prefix,
+   * same status badge, same summary table — so an admin sees the same shape of message
+   * whether the failure was on the server side or on Snowstorm's side.
+   *
+   * <p>No-op when email isn't configured or recipients aren't set — matches the
+   * polling path's behaviour. Pass {@code branchPath} so the subject still shows the
+   * affected branch even though we never made it to Snowstorm.
+   */
+  public void notifyUploadFailure(String branchPath, String archiveUuid, String errorMessage) {
+    if (!emailService.hasImportRecipients() || !emailService.isConfigured() || !emailService.isEnabled()) {
+      return;
+    }
+    try {
+      // Build a synthetic tracking with status=FAILED and finished=now so the same
+      // helpers (buildSubject, buildSummaryTable, buildDetailsSection) work unchanged.
+      SnomedImportTracking synthetic = new SnomedImportTracking()
+          .setSnowstormJobId(archiveUuid != null ? "upload-stage-failure:" + archiveUuid : "upload-stage-failure")
+          .setBranchPath(branchPath)
+          .setType("upload")
+          .setStatus("FAILED")
+          .setStarted(OffsetDateTime.now())
+          .setFinished(OffsetDateTime.now())
+          .setErrorMessage(errorMessage)
+          .setNotified(true);
+      // Empty SnomedImportJob — we have no Snowstorm-side data; helpers null-guard.
+      SnomedImportJob noJob = new SnomedImportJob();
+      noJob.setStatus("FAILED");
+      noJob.setErrorMessage(errorMessage);
+
+      String subject = buildSubject(synthetic, noJob);
+      String htmlBody = buildHtmlBody(synthetic, noJob);
+      List<String> recipients = emailService.getImportRecipients();
+      log.info("Sending SNOMED upload-stage failure notification to {} recipient(s)", recipients.size());
+      emailService.sendToMultiple(recipients, subject, htmlBody, true);
+    } catch (Exception e) {
+      log.error("Failed to send SNOMED upload-stage failure notification", e);
     }
   }
 
@@ -133,6 +188,8 @@ public class SnomedImportPollingService {
             .details-section { background-color: white; padding: 15px; margin: 10px 0; border-left: 4px solid #007bff; border-radius: 3px; }
             .details-section h3 { margin-top: 0; color: #007bff; font-size: 16px; }
             .error-message { color: #dc3545; padding: 10px; background-color: #f8d7da; border-radius: 3px; }
+            .message-list { margin: 0; padding-left: 20px; }
+            .message-list li { margin: 5px 0; }
             .footer { text-align: center; margin-top: 30px; padding-top: 20px; border-top: 1px solid #dee2e6; color: #6c757d; font-size: 12px; }
           </style>
         </head>
@@ -196,19 +253,51 @@ public class SnomedImportPollingService {
         );
   }
 
+  // TODO(snomed-import): pull Snowstorm-side entity counts into the email.
+  // Snowstorm's GET /imports/{id} returns only status + branchPath + moduleIds + error —
+  // not "X concepts added, Y descriptions added, Z relationships added". Getting those
+  // requires a second integration:
+  //   * Snapshot the branch state BEFORE submitting the import (e.g. GET /branches/{path}
+  //     to capture the head-effective-time, or GET /branches/{path}/effective-time/{date}
+  //     for per-effective-time counts).
+  //   * After polling sees COMPLETED, run the same queries against the new head and diff
+  //     them.
+  // Caveats — branch-merge windows make the "before" snapshot fragile if the branch was
+  // active when the import landed; SCT release timing can mean entity-counts queries miss
+  // the just-imported delta until Snowstorm's effective-time index is refreshed. Either
+  // add a small retry loop around the post-import query, or skip count reporting and
+  // surface only the timestamps Snowstorm DOES expose. When implemented, append the
+  // resulting lines to tracking.getDetails() before save() so they land in the same
+  // "Import Lifecycle" section the email already renders.
   private String buildDetailsSection(SnomedImportTracking tracking, SnomedImportJob snowstormJob) {
+    StringBuilder out = new StringBuilder("<div class='details'>");
+
+    // Lifecycle log lines captured by SnomedRF2ImportFromArchiveService during the upload
+    // and by checkAndNotify() when the terminal status is reached. Mirrors the LOINC
+    // import-completion email "Success Messages" block.
+    if (CollectionUtils.isNotEmpty(tracking.getDetails())) {
+      out.append("""
+          <div class="details-section">
+            <h3>Import Lifecycle</h3>
+            <ul class="message-list">
+          """);
+      for (String line : tracking.getDetails()) {
+        out.append("<li>").append(escapeHtml(line)).append("</li>");
+      }
+      out.append("</ul></div>");
+    }
+
     if (tracking.getErrorMessage() != null || snowstormJob.getErrorMessage() != null) {
       String errorMsg = tracking.getErrorMessage() != null ? tracking.getErrorMessage() : snowstormJob.getErrorMessage();
-      return """
-          <div class="details">
-            <div class="details-section">
-              <h3>Error Details</h3>
-              <div class="error-message">%s</div>
-            </div>
+      out.append("""
+          <div class="details-section">
+            <h3>Error Details</h3>
+            <div class="error-message">%s</div>
           </div>
-          """.formatted(escapeHtml(errorMsg));
+          """.formatted(escapeHtml(errorMsg)));
     }
-    return "";
+    out.append("</div>");
+    return out.toString();
   }
 
   private String formatDuration(Duration duration) {
