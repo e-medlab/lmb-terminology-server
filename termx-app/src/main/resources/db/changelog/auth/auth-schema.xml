@@ -11,15 +11,16 @@
     </changeSet>
 
     <changeSet id="default_privileges_for_schema_auth" author="kodality">
+        <validCheckSum>ANY</validCheckSum>
         <sql>
-            GRANT USAGE ON SCHEMA auth TO termserver_app;
-            ALTER DEFAULT PRIVILEGES IN SCHEMA auth GRANT USAGE ON SEQUENCES TO termserver_app;
-            ALTER DEFAULT PRIVILEGES IN SCHEMA auth GRANT EXECUTE ON FUNCTIONS TO termserver_app;
-            ALTER DEFAULT PRIVILEGES IN SCHEMA auth GRANT SELECT,INSERT,UPDATE ON TABLES TO termserver_app;
+            GRANT USAGE ON SCHEMA auth TO tx_app;
+            ALTER DEFAULT PRIVILEGES IN SCHEMA auth GRANT USAGE ON SEQUENCES TO tx_app;
+            ALTER DEFAULT PRIVILEGES IN SCHEMA auth GRANT EXECUTE ON FUNCTIONS TO tx_app;
+            ALTER DEFAULT PRIVILEGES IN SCHEMA auth GRANT SELECT,INSERT,UPDATE ON TABLES TO tx_app;
 
-            GRANT USAGE ON SCHEMA auth TO termserver_viewer;
-            ALTER DEFAULT PRIVILEGES IN SCHEMA auth GRANT EXECUTE ON FUNCTIONS TO termserver_viewer;
-            ALTER DEFAULT PRIVILEGES IN SCHEMA auth GRANT SELECT ON TABLES TO termserver_viewer;
+            GRANT USAGE ON SCHEMA auth TO tx_viewer;
+            ALTER DEFAULT PRIVILEGES IN SCHEMA auth GRANT EXECUTE ON FUNCTIONS TO tx_viewer;
+            ALTER DEFAULT PRIVILEGES IN SCHEMA auth GRANT SELECT ON TABLES TO tx_viewer;
         </sql>
     </changeSet>
 
