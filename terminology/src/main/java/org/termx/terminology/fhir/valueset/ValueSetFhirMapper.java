@@ -75,6 +75,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import org.apache.commons.lang3.tuple.Pair;
 
 import static java.util.stream.Collectors.toList;
@@ -166,6 +167,8 @@ public class ValueSetFhirMapper extends BaseFhirMapper {
     fhirValueSet.setExperimental(valueSet.getExperimental() != null && valueSet.getExperimental());
     Optional.ofNullable(valueSet.getSourceReference()).ifPresent(ref -> fhirValueSet.addExtension(toFhirSourceReferenceExtension("http://hl7.org/fhir/StructureDefinition/valueset-sourceReference", ref)));
     Optional.ofNullable(valueSet.getReplaces()).flatMap(id -> Optional.ofNullable(valueSetService.load(id)).map(ValueSet::getUri)).ifPresent(uri -> fhirValueSet.addExtension(toFhirReplacesExtension(uri)));
+    Optional.ofNullable(version.getSupportedLanguages()).orElse(List.of())
+        .forEach(language -> fhirValueSet.addExtension(new Extension(SUPPORTED_LANGUAGE_EXTENSION_URL).setValueCode(language)));
     fhirValueSet.setDate(toFhirOffsetDateTime(provenances));
     fhirValueSet.setLastReviewDate(toFhirDate(provenances, "reviewed"));
     fhirValueSet.setApprovalDate(toFhirDate(provenances, "approved"));
@@ -323,6 +326,8 @@ public class ValueSetFhirMapper extends BaseFhirMapper {
 
   public com.kodality.zmei.fhir.resource.terminology.ValueSet toFhir(ValueSet valueSet, ValueSetVersion version, List<Provenance> provenances, ValueSetSnapshot snapshot, Parameters param) {
     com.kodality.zmei.fhir.resource.terminology.ValueSet fhirValueSet = toFhir(valueSet, version, provenances);
+    // The set of languages carried by the expansion is advertised as repeated `supported-language`
+    // extensions on the resource (added in the base toFhir from version.supportedLanguages).
     fhirValueSet.setExpansion(toFhirExpansion(snapshot, fhirValueSet.getCompose().getProperty(), param));
     return fhirValueSet;
   }
@@ -634,6 +639,11 @@ public class ValueSetFhirMapper extends BaseFhirMapper {
     if (description != null) {
       version.setDescription(new LocalizedName(Map.of(Optional.ofNullable(version.getPreferredLanguage()).orElse(Language.en), description)));
     }
+    // Declared languages come from the supported-language extensions; union with the preferred language.
+    version.setSupportedLanguages(Stream.concat(
+            fromFhirLanguageExtensions(valueSet.getExtension(), SUPPORTED_LANGUAGE_EXTENSION_URL).stream(),
+            Stream.ofNullable(version.getPreferredLanguage()))
+        .filter(Objects::nonNull).distinct().toList());
     return version;
   }
 

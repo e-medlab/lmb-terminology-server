@@ -104,6 +104,8 @@ public class CodeSystemFhirMapper extends BaseFhirMapper {
     if (StringUtils.isNotEmpty(versionDescription)) {
       fhirCodeSystem.addExtension(toFhirVersionDescriptionExtension(versionDescription));
     }
+    Optional.ofNullable(version.getSupportedLanguages()).orElse(List.of())
+        .forEach(language -> fhirCodeSystem.addExtension(new Extension(SUPPORTED_LANGUAGE_EXTENSION_URL).setValueCode(language)));
     fhirCodeSystem.setPurpose(toFhirName(codeSystem.getPurpose(), version.getPreferredLanguage()));
     fhirCodeSystem.setTopic(toFhirTopic(codeSystem.getTopic()));
     fhirCodeSystem.setUseContext(toFhirUseContext(codeSystem.getUseContext()));
@@ -548,8 +550,12 @@ public class CodeSystemFhirMapper extends BaseFhirMapper {
         .map(CodeSystemConcept::getDesignation)
         .filter(Objects::nonNull).flatMap(List::stream)
         .map(CodeSystemConceptDesignation::getLanguage);
-    version.setSupportedLanguages(Stream.concat(
-          supportedLanguages,
+    // Declared languages come from the supported-language extensions; union them with the languages
+    // observed on designations and the preferred language so nothing is lost on round-trip.
+    Stream<String> declaredLanguages = fromFhirLanguageExtensions(fhirCodeSystem.getExtension(), SUPPORTED_LANGUAGE_EXTENSION_URL).stream();
+    version.setSupportedLanguages(Stream.concat(Stream.concat(
+          declaredLanguages,
+          supportedLanguages),
           Stream.of(version.getPreferredLanguage()))
         .filter(Objects::nonNull)
         .distinct().toList());
