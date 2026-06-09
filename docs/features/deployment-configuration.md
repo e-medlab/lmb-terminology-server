@@ -307,7 +307,53 @@ for local/dev only. Set real secrets and disable mock/dev auth in production.
 
 ---
 
-## 8. Related docs
+## 8. LMB fork — configuration extension
+
+> Applies to the **e-medlab/lmb-terminology-server** fork only. These parameters extend or override
+> the upstream configuration above. The fork's reference deployment env is
+> [`deployment/docker-compose/server.env`](../../deployment/docker-compose/server.env).
+
+### 8.1 Overridden upstream defaults
+| Env var | Upstream default | LMB default | Why |
+|---|---|---|---|
+| `GUEST_DISABLED` | `false` | `true` | LMB requires authentication; guest/anonymous access is off by default. |
+
+### 8.2 NSOFT user directory (LMB-specific)
+| Env var (property) | Default | Purpose |
+|---|---|---|
+| `NSOFT_URL` (`nsoft.url`) | `https://dev.mnkv.nsoft.lt` | Base URL of the NSOFT service. It **activates** the fork's `TermxUserProvider` (`@Requires(property="nsoft.url")`), which fetches the user list from `<NSOFT_URL>/info/users` to serve `/api/users`. If unset, the provider is not loaded. |
+| `TERMX_USER_PROVIDER_LOG_LEVEL` | `DEBUG` | Log level for `org.termx.user.TermxUserProvider` — useful when troubleshooting `/api/users` and the upstream NSOFT call in containers. |
+
+A NSOFT mock for local testing lives under [`tools/mock-nsoft/`](../../tools/mock-nsoft/).
+
+### 8.3 OAuth privilege mapping (LMB-specific)
+The fork chooses how an OAuth session's privileges are resolved:
+| Env var (property) | Default | Purpose |
+|---|---|---|
+| `AUTH_PRIVILEGE_MAPPER_STORE` (`auth.privilege.mapper.store`) | `disabled` | DB-stored privilege mapper. `disabled` turns it off (the bean is `@Requires(notEquals="disabled")`). |
+| `AUTH_PRIVILEGE_MAPPER_DIRECT` (`auth.privilege.mapper.direct`) | `privileges` | Enables the **direct** mapper and names the **OAuth token claim** to read the privilege list from (here the `privileges` claim). |
+
+So LMB reads privileges directly from the token's `privileges` claim instead of a stored mapping.
+
+### 8.4 GitHub App (fully wired in the fork)
+| Env var (property) | Default | Purpose |
+|---|---|---|
+| `GITHUB_CLIENT_ID` (`github.client.id`) | `client-id` | GitHub App client id |
+| `GITHUB_CLIENT_SECRET` (`github.client.secret`) | `secret` | GitHub App client secret |
+| `GITHUB_APP_ID` (`github.app-id`) | (none) | GitHub App id |
+| `GITHUB_APP_NAME` (`github.app-name`) | (none) | GitHub App name |
+| `GITHUB_PRIVATE_KEY_PATH` (`github.private-key-path`) | `/path/to/private-key.pem` | Path to the GitHub App private key inside the container |
+
+### 8.5 Notes
+- The fork's `deployment/docker-compose/server.env` uses the `MINIO_*` spelling (matching the
+  `application.yml` placeholders), not `BOB_MINIO_*` — both bind to `bob.minio.*`.
+- The image adds `entrypoint.sh` + `/certs` (custom CA trust) on top of upstream's Dockerfile.
+- Dev auth uses `YupiSessionProvider` (`Bearer yupi`, order 3 — ahead of mock auth at order 5) with
+  `auth.dev.yupi.privileges` (comma-separated `{resource}.{type}.{action}`, default `*.*.*`). Dev only.
+
+---
+
+## 9. Related docs
 - [`large-terminology-import.md`](large-terminology-import.md) — SNOMED/LOINC archive import, storage, retention.
 - [`smtp-email-support.md`](smtp-email-support.md) — email setup.
 - [`mock-auth.md`](mock-auth.md) — mock auth provider.
