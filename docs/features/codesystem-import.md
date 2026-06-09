@@ -70,6 +70,14 @@ FHIR resource) to persisted concepts and **entity versions**, the merge vs. repl
 6. `activate` the active versions, `retire` the retired ones, then `linkEntityVersions` to bind the
    versions to the code-system version; finally upsert associations.
 
+> **Clean-version vs merge.** The per-concept hold above only applies to a normal import. A
+> *clean-version* import (`cleanRun` / the "clean version" option — which the **FHIR import path
+> always uses**) first cancels and recreates the whole CS version (`saveCodeSystemVersion`), so the
+> per-concept lookup finds nothing and every concept necessarily gets a fresh version. Rebuilding the
+> version is the point of that mode; it is separate from the merge described here. (A non-clean
+> re-import into an already-*active* version is rejected with `TE104` — re-import targets a draft
+> version, or uses clean-version.)
+
 ## 5. Content signature & version churn
 
 `ConceptContentSignature` produces a canonical, **type-aware** fingerprint of a concept version so
@@ -80,8 +88,10 @@ reloaded from the database — only a genuine content change creates a version.
 - **By code, not id:** designation type is compared by its code (`designationType`), property by its
   name, association by `associationType|targetCode|orderNumber` — internal DB ids never enter the
   fingerprint (the import file only carries codes).
-- **Order is significant** (the file defines the order); designation/property/association lists are
-  compared in order, not as unordered sets.
+- **Canonical order** (not list order): the DB load order is not guaranteed (designations and
+  associations have no `ORDER BY`), so the lists are sorted before comparison — designations by
+  **language then text**, properties/associations by their identity — and the order a file happens to
+  list them in does not matter.
 - **Value normalization** (identical on both sides): decimal by value ignoring scale
   (`2.5` = `2.50`), integer (`5` = `"5"` = `5.0`), boolean (`true` = `"1"`), dateTime as a UTC
   instant (`java.util.Date` = epoch millis = `2026-06-08` = `…T00:00:00Z`), coding by `code|system`.
