@@ -95,6 +95,18 @@ public class SnomedDeltaCalculateService {
     if (currentBranch != null && baselineBranch != null && !currentBranch.equals(baselineBranch)) {
       throw new IllegalArgumentException("Baseline branchPath (" + baselineBranch + ") differs from current (" + currentBranch + ")");
     }
+    // Fail fast on a non-forward delta. If the current edition is not newer than the baseline the
+    // delta is empty, and the upstream delta-generator crashes (ArrayIndexOutOfBounds) instead of
+    // producing an empty archive — so reject it here with a clear message rather than after a
+    // multi-minute subprocess run. effectiveTime is YYYYMMDD, so a lexical compare is chronological.
+    String currentEffectiveTime = metaString(current, "effectiveTime");
+    String baselineEffectiveTime = metaString(baseline, "effectiveTime");
+    if (currentEffectiveTime != null && baselineEffectiveTime != null
+        && currentEffectiveTime.compareTo(baselineEffectiveTime) <= 0) {
+      throw new IllegalArgumentException("Current edition effectiveTime (" + currentEffectiveTime
+          + ") is not newer than the baseline (" + baselineEffectiveTime + "); the delta would be empty. "
+          + "Select a newer edition as the current archive.");
+    }
     // The Stored archives card filters by JSONB containment on {shortName, branchPath}, so
     // the delta has to carry both keys or it disappears from the card it should appear in.
     // Take shortName from the current archive (the new state, which has the meta tags
@@ -248,7 +260,22 @@ public class SnomedDeltaCalculateService {
     if (o.getStorage() == null || !SnomedBobContainerAuthorizer.CONTAINER.equals(o.getStorage().getContainer())) {
       throw new IllegalArgumentException("Archive '" + uuid + "' is not in the SNOMED container");
     }
+    // The delta-generator expects RF2 zips. Without this check a non-RF2 object in the SNOMED
+    // container (e.g. a JSON nomenclature file) reaches the tool, which then finds 0 components and
+    // crashes in createArchive. Reject it here with the offending filename/content-type.
+    if (!isRf2Archive(o.getStorage().getFilename(), o.getContentType())) {
+      throw new IllegalArgumentException("Archive '" + uuid + "' is not an RF2 zip (filename='"
+          + o.getStorage().getFilename() + "', contentType='" + o.getContentType()
+          + "'). The SNOMED delta requires RF2 .zip archives for both the baseline and the current edition.");
+    }
     return o;
+  }
+
+  /** An RF2 archive is a zip — accept when either the filename ends in .zip or the content-type says zip. */
+  static boolean isRf2Archive(String filename, String contentType) {
+    boolean zipName = filename != null && filename.toLowerCase().endsWith(".zip");
+    boolean zipType = contentType != null && contentType.toLowerCase().contains("zip");
+    return zipName || zipType;
   }
 
   private static String metaString(BobObject o, String key) {
