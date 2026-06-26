@@ -1,6 +1,6 @@
 plugins {
     `maven-publish`
-    id("org.owasp.dependencycheck") version "8.4.2"
+    id("org.owasp.dependencycheck") version "12.1.0"
     id("io.micronaut.minimal.library") version "4.6.2"
     id("io.micronaut.minimal.application") version "4.6.2"
     id("com.gradleup.shadow") version "9.3.2" apply false
@@ -10,6 +10,20 @@ plugins {
 
 group = "org.termx"
 version = file("VERSION").readText().trim()
+
+// OWASP dependency-check: NIST retired the legacy NVD v1.1 JSON data feeds (they now return 403),
+// so this runs against the NVD API 2.0. An NVD API key (the NVD_API_KEY secret, optional locally)
+// lifts the strict anonymous rate limit; CI also caches the downloaded CVE database between runs.
+dependencyCheck {
+    nvd {
+        apiKey = System.getenv("NVD_API_KEY")
+        // The NVD API intermittently returns empty/error responses on the bulk download, which
+        // otherwise aborts the build (NvdCveClient NPE). Pace the calls and retry to ride it out;
+        // once the cached DB is seeded, later runs only fetch small incremental updates.
+        delay = 4000
+        maxRetryCount = 30
+    }
+}
 
 allprojects {
     apply(plugin = "java-library")
@@ -37,17 +51,24 @@ allprojects {
     repositories {
         mavenLocal()
         mavenCentral()
-        // kefhir fork on GitHub Packages (commons and zmei are vendored)
-        maven {
-            url = uri("https://maven.pkg.github.com/termx-health/kefhir")
-            content {
-                includeGroup("com.kodality.kefhir")
+        // kefhir fork on GitHub Packages (commons and zmei are vendored).
+        // exclusiveContent: com.kodality.kefhir is resolved ONLY from this repo and is never
+        // searched in mavenLocal / mavenCentral — so resolution shows a single (GitHub Packages)
+        // URL instead of also probing file:~/.m2 and repo.maven.apache.org for a private artifact.
+        exclusiveContent {
+            forRepository {
+                maven {
+                    url = uri("https://maven.pkg.github.com/termx-health/kefhir")
+                    credentials {
+                        username = project.findProperty("gpr.user") as String? ?: System.getenv("GITHUB_ACTOR")
+                        password = project.findProperty("gpr.key") as String?
+                            ?: project.findProperty("gpr.token") as String?
+                            ?: System.getenv("GITHUB_TOKEN")
+                    }
+                }
             }
-            credentials {
-                username = project.findProperty("gpr.user") as String? ?: System.getenv("GITHUB_ACTOR")
-                password = project.findProperty("gpr.key") as String?
-                    ?: project.findProperty("gpr.token") as String?
-                    ?: System.getenv("GITHUB_TOKEN")
+            filter {
+                includeGroup("com.kodality.kefhir")
             }
         }
     }

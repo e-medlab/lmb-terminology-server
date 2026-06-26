@@ -24,6 +24,7 @@ import org.termx.ts.codesystem.CodeSystemQueryParams;
 import org.termx.ts.codesystem.CodeSystemVersionReference;
 import org.termx.ts.codesystem.Concept;
 import org.termx.ts.codesystem.ConceptQueryParams;
+import io.micronaut.core.util.StringUtils;
 import org.termx.ts.codesystem.Designation;
 import com.kodality.commons.model.QueryResult;
 import org.termx.ts.valueset.*;
@@ -53,6 +54,8 @@ public class ValueSetExpandOperation implements InstanceOperationDefinition, Typ
   private final List<ValueSetExternalExpandProvider> externalExpandProviders;
   private final CodeSystemService codeSystemService;
   private final ConceptService conceptService;
+  private final org.termx.terminology.terminology.codesystem.concept.ConceptSupplementService conceptSupplementService;
+  private final org.termx.terminology.terminology.codesystem.entity.CodeSystemEntityVersionService codeSystemEntityVersionService;
 
   // SNOMED CT implicit-ValueSet URL family
   // https://build.fhir.org/ig/HL7/UTG/en/SNOMEDCT.html
@@ -102,10 +105,37 @@ public class ValueSetExpandOperation implements InstanceOperationDefinition, Typ
       return expandInline(inlineVs, req);
     }
 
-    // 2. Fall back to url-based lookup (existing logic)
-    String url = req.findParameter("url").map(pp -> pp.getValueUrl() != null ? pp.getValueUrl() : pp.getValueString())
+    // 2. Fall back to url-based lookup (existing logic).
+    // `url` is a uri/canonical, so accept valueUri (what the FHIR spec & tx-ecosystem tests send) in
+    // addition to valueUrl/valueString — previously a POSTed `url` as valueUri was missed → 400.
+    String url = req.findParameter("url")
+        .map(pp -> pp.getValueUrl() != null ? pp.getValueUrl()
+            : pp.getValueUri() != null ? pp.getValueUri()
+            : pp.getValueCanonical() != null ? pp.getValueCanonical()
+            : pp.getValueString())
         .orElseThrow(() -> new FhirException(400, IssueType.INVALID, "parameter 'url' or 'valueSet' required"));
-    String versionNr = req.findParameter("valueSetVersion").map(ParametersParameter::getValueString).orElse(null);
+    // Pipe-form canonical `<url>|<version>` (FHIR & tx-ecosystem) — split as terminology-explorer's
+    // CanonicalUrlParser does (version = everything after the first '|'). Keep the original `url` for the
+    // SNOMED implicit-ValueSet handling below (its own `|edition/version` syntax differs); resolve stored and
+    // tx-resource ValueSets by the bare canonical, with the pipe version as the requested version when
+    // `valueSetVersion` isn't separately supplied.
+    String canonicalUrl = url;
+    String pipeVersion = null;
+    if (!url.startsWith("http://snomed.info/sct")) {
+      int pipe = url.indexOf('|');
+      if (pipe >= 0) {
+        canonicalUrl = url.substring(0, pipe);
+        pipeVersion = url.substring(pipe + 1);
+        // A query suffix (e.g. the LOINC/implicit `?fhir_vs`) sits after the pipe-version in
+        // `<canonical>|<version>?fhir_vs` — it is not part of the version. Strip it; the full
+        // `url` (query intact) still drives the implicit-ValueSet handling below.
+        int q = pipeVersion.indexOf('?');
+        if (q >= 0) {
+          pipeVersion = pipeVersion.substring(0, q);
+        }
+      }
+    }
+    String versionNr = req.findParameter("valueSetVersion").map(ParametersParameter::getValueString).orElse(pipeVersion);
 
     // 3. SNOMED CT implicit-ValueSet URLs (`http://snomed.info/sct[/<edition>/version/<date>]?fhir_vs[=...]`)
     //    are recognised before the stored-VS lookup and delegated to the
@@ -116,9 +146,28 @@ public class ValueSetExpandOperation implements InstanceOperationDefinition, Typ
       return snomedResp;
     }
 
+    // 3b. tx-resource: the FHIR validator passes referenced resources inline. When `url` names a ValueSet
+    //     supplied as a tx-resource, expand that inline definition instead of looking it up in storage. When
+    //     several versions of the same canonical are supplied, a pinned version must resolve to exactly that
+    //     one (unknown version → 404); otherwise the latest is used.
+    List<com.kodality.zmei.fhir.resource.terminology.ValueSet> txVs = txResourceValueSets(req, canonicalUrl);
+    if (!txVs.isEmpty()) {
+      com.kodality.zmei.fhir.resource.terminology.ValueSet txResourceVs;
+      if (versionNr != null) {
+        String canonical = canonicalUrl;
+        String pinned = versionNr;
+        txResourceVs = txVs.stream().filter(vs -> pinned.equals(vs.getVersion())).findFirst()
+            .orElseThrow(() -> org.termx.terminology.fhir.TxIssues.notFoundException(404,
+                String.format("A definition for the value Set '%s|%s' could not be found", canonical, pinned)));
+      } else {
+        txResourceVs = latestByVersion(txVs);
+      }
+      return expandInline(txResourceVs, req);
+    }
+
     // 4. Stored ValueSet lookup.
     ValueSetQueryParams vsParams = new ValueSetQueryParams();
-    vsParams.setUri(url);
+    vsParams.setUri(canonicalUrl);
     vsParams.setLimit(1);
     vsParams.setPermittedIds(SessionStore.require().getPermittedResourceIds(Privilege.VS_READ));
     ValueSet valueSet = valueSetService.query(vsParams).findFirst().orElse(null);
@@ -154,16 +203,41 @@ public class ValueSetExpandOperation implements InstanceOperationDefinition, Typ
       throw new FhirException(404, IssueType.NOTFOUND, "value set version not found");
     }
 
-    String displayLanguage = req == null ? null : req.findParameter("displayLanguage").map(ParametersParameter::getValueCode)
+    String requestedLanguage = req == null ? null : req.findParameter("displayLanguage").map(ParametersParameter::getValueCode)
         .orElse(req.findParameter("displayLanguage").map(ParametersParameter::getValueString)
         .orElse(req.findParameter("defaultLanguage").map(ParametersParameter::getValueCode)
         .orElse(req.findParameter("defaultLanguage").map(ParametersParameter::getValueString).orElse(null))));
+    // Default the display language: an explicit request wins; otherwise fall back to the value set's own
+    // resource language (FHIR ValueSet.language → version.preferredLanguage), and finally to "en". So a
+    // localized value set (e.g. language=et with an Estonian supplement) renders its Estonian displays by
+    // default instead of always English.
+    String vsLanguage = version.getPreferredLanguage();
+    String displayLanguage = StringUtils.isNotEmpty(requestedLanguage) ? requestedLanguage
+        : StringUtils.isNotEmpty(vsLanguage) ? vsLanguage : "en";
     boolean includeDesignations = req != null && req.findParameter("includeDesignations")
         .map(pr -> pr.getValueBoolean() != null && pr.getValueBoolean() || "true".equals(pr.getValueString()))
         .orElse(false);
 
     ValueSetSnapshot snapshot = valueSetVersionConceptService.expand(vs.getId(), version.getVersion(), displayLanguage, includeDesignations);
     List<ValueSetVersionConcept> expandedConcepts = snapshot.getExpansion();
+
+    // Layer supplements (e.g. a SNOMED-based supplement's localized designations) onto the expanded
+    // members. The external SNOMED expand provider fetches base concepts from Snowstorm but never applies
+    // supplements, so they were absent from $expand. Fire only when a language/designations were actually
+    // requested, the value set declares its own resource language (its displays are meant to be localized),
+    // or a supplement is explicitly named — NOT for a plain English-default expand, so the common path
+    // keeps its request-agnostic snapshot without paying for supplement auto-discovery.
+    boolean applySupplements = StringUtils.isNotEmpty(requestedLanguage) || StringUtils.isNotEmpty(vsLanguage)
+        || includeDesignations || StringUtils.isNotEmpty(extractUseSupplement(req));
+    List<org.termx.terminology.terminology.codesystem.concept.ConceptSupplementService.UsedSupplement> usedSupplements = List.of();
+    if (applySupplements) {
+      usedSupplements = conceptSupplementService.mergeSupplementsIntoExpansion(expandedConcepts, supplementParams(displayLanguage, req));
+    }
+    // The stored snapshot doesn't carry concept property values; load them on demand when the request asks
+    // for properties (FHIR $expand `property`), so contains[].property can be populated. Skipped otherwise.
+    if (!designationOrPropertyRequested(req, "property").isEmpty()) {
+      decoratePropertyValues(expandedConcepts);
+    }
     List<Provenance> provenances = provenanceService.find("ValueSetVersion|" + version.getId());
 
     // FHIR R5 ValueSet/$expand `filter`: free-text typeahead filter applied to the
@@ -212,11 +286,855 @@ public class ValueSetExpandOperation implements InstanceOperationDefinition, Typ
           .setCreatedBy(snapshot.getCreatedBy());
     }
 
-    return mapper.toFhir(vs, version, provenances, snapshot, req);
+    com.kodality.zmei.fhir.resource.terminology.ValueSet result = mapper.toFhir(vs, version, provenances, snapshot, req);
+    appendUsedSupplements(result, usedSupplements);
+    return result;
+  }
+
+  /**
+   * Appends a {@code used-supplement} expansion parameter (resolved {@code url|version}) for each supplement
+   * that actually contributed to the expansion — the output counterpart of the {@code useSupplement} request
+   * input, which is itself not echoed (see {@code ValueSetFhirMapper.EXPANSION_SELECTION_PARAMETERS}).
+   */
+  private static void appendUsedSupplements(com.kodality.zmei.fhir.resource.terminology.ValueSet result,
+      List<org.termx.terminology.terminology.codesystem.concept.ConceptSupplementService.UsedSupplement> usedSupplements) {
+    if (result == null || result.getExpansion() == null || usedSupplements == null || usedSupplements.isEmpty()) {
+      return;
+    }
+    List<com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionParameter> params =
+        new java.util.ArrayList<>(result.getExpansion().getParameter() != null ? result.getExpansion().getParameter() : List.of());
+    usedSupplements.forEach(s -> params.add(new com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionParameter()
+        .setName("used-supplement").setValueUri(s.asCanonical())));
+    result.getExpansion().setParameter(params);
+  }
+
+  /**
+   * Enriches members the SQL expand couldn't resolve — those from an external (provider-backed, e.g.
+   * SNOMED via Snowstorm) code system come back with no display/designations because the in-DB expand
+   * has no access to the provider. Fetches them through the concept providers by code system + code and
+   * grafts the display + designations. Only members missing a display are fetched, so a pure-local
+   * expansion makes no provider calls.
+   */
+  private void enrichExternalMembers(List<ValueSetVersionConcept> members, String displayLanguage) {
+    java.util.Map<String, List<ValueSetVersionConcept>> byCodeSystem = new java.util.LinkedHashMap<>();
+    for (ValueSetVersionConcept m : members) {
+      if (m.getConcept() == null || StringUtils.isEmpty(m.getConcept().getCode())) {
+        continue;
+      }
+      if (m.getDisplay() != null && StringUtils.isNotEmpty(m.getDisplay().getName())) {
+        continue;
+      }
+      String csId = resolveCodeSystemId(m.getConcept());
+      if (StringUtils.isEmpty(csId)) {
+        continue;
+      }
+      byCodeSystem.computeIfAbsent(csId, key -> new java.util.ArrayList<>()).add(m);
+    }
+    byCodeSystem.forEach((csId, csMembers) -> {
+      List<String> codes = csMembers.stream().map(m -> m.getConcept().getCode()).distinct().toList();
+      java.util.Map<String, Concept> byCode = conceptService.query(new ConceptQueryParams()
+              .setCodeSystem(csId).setCodes(codes).setDisplayLanguage(displayLanguage).limit(codes.size()))
+          .getData().stream().collect(java.util.stream.Collectors.toMap(Concept::getCode, c -> c, (a, b) -> a));
+      csMembers.forEach(m -> {
+        Concept src = byCode.get(m.getConcept().getCode());
+        if (src == null || src.getVersions() == null || src.getVersions().isEmpty()) {
+          return;
+        }
+        // A code can be a member at several code system versions, each with its own display/designations. Pick the
+        // entity version matching THIS member's version id (so each version shows its own display), falling back to
+        // the first when the member carries no version id (the common single-version case).
+        Long memberCsev = m.getConcept().getConceptVersionId();
+        CodeSystemEntityVersion srcVersion = src.getVersions().stream()
+            .filter(v -> memberCsev != null && memberCsev.equals(v.getId()))
+            .findFirst().orElse(src.getVersions().get(0));
+        List<Designation> designations = java.util.Optional.ofNullable(srcVersion.getDesignations()).orElse(List.of());
+        Designation display = ConceptUtil.getDisplay(designations, displayLanguage, List.of());
+        if (display != null) {
+          m.setDisplay(display);
+        }
+        if (m.getAdditionalDesignations() == null || m.getAdditionalDesignations().isEmpty()) {
+          m.setAdditionalDesignations(designations);
+        }
+      });
+    });
+  }
+
+  /** Resolves the internal code system id for an expansion member, mapping a canonical url to the stored id when the id is absent (inline/external members); null when it resolves to no stored code system (nothing to enrich from). */
+  private String resolveCodeSystemId(ValueSetVersionConcept.ValueSetVersionConceptValue c) {
+    if (StringUtils.isNotEmpty(c.getCodeSystem())) {
+      java.util.Optional<CodeSystem> loaded = codeSystemService.load(c.getCodeSystem());
+      if (loaded != null && loaded.isPresent()) {
+        return c.getCodeSystem();
+      }
+    }
+    String uri = StringUtils.isNotEmpty(c.getCodeSystemUri()) ? c.getCodeSystemUri() : c.getCodeSystem();
+    if (StringUtils.isEmpty(uri)) {
+      return null;
+    }
+    // Unresolvable code system → no provider to enrich from; skip rather than query with a bogus id.
+    var byUri = codeSystemService.query(new CodeSystemQueryParams().setUri(uri).limit(1));
+    return byUri == null ? null : byUri.findFirst().map(CodeSystem::getId).orElse(null);
+  }
+
+  /** Builds the supplement context for an expansion: auto-load supplements for the requested displayLanguage, plus any explicit {@code useSupplement}. */
+  private static ConceptQueryParams supplementParams(String displayLanguage, Parameters req) {
+    return new ConceptQueryParams()
+        .setIncludeSupplement(true)
+        .setDisplayLanguage(displayLanguage)
+        .setUseSupplement(extractUseSupplement(req))
+        // The supplement's own concepts are loaded through ConceptService, which filters by permitted code
+        // systems — a null list matches NOTHING (`code_system in (null)`), so without this the supplement
+        // designations never load and the inline expansion silently keeps the base display. Scope it to the
+        // caller's CS_READ grants.
+        .setPermittedCodeSystems(SessionStore.require().getPermittedResourceIds(Privilege.CS_READ));
+  }
+
+  private static String extractUseSupplement(Parameters req) {
+    if (req == null || req.getParameter() == null) {
+      return null;
+    }
+    java.util.stream.Stream<String> explicit = req.getParameter().stream()
+        .filter(p -> "useSupplement".equals(p.getName()))
+        .map(p -> p.getValueCanonical() != null ? p.getValueCanonical()
+            : p.getValueUri() != null ? p.getValueUri()
+                : p.getValueUrl() != null ? p.getValueUrl() : p.getValueString());
+    // Auto-apply a BUNDLED supplement: a tx-resource CodeSystem with content=supplement is applied to the
+    // expansion even without an explicit useSupplement (the reference does this). A supplement for a code system
+    // not in the expansion contributes nothing (no member matches), so this is safe.
+    java.util.stream.Stream<String> bundled = req.getParameter().stream()
+        .filter(p -> "tx-resource".equals(p.getName()) && p.getResource() instanceof com.kodality.zmei.fhir.resource.terminology.CodeSystem cs
+            && "supplement".equals(cs.getContent()) && cs.getUrl() != null)
+        .map(p -> {
+          com.kodality.zmei.fhir.resource.terminology.CodeSystem cs = (com.kodality.zmei.fhir.resource.terminology.CodeSystem) p.getResource();
+          return cs.getUrl() + (StringUtils.isNotEmpty(cs.getVersion()) ? "|" + cs.getVersion() : "");
+        });
+    String joined = java.util.stream.Stream.concat(explicit, bundled)
+        .filter(StringUtils::isNotEmpty)
+        .distinct()
+        .collect(java.util.stream.Collectors.joining(","));
+    return StringUtils.isEmpty(joined) ? null : joined;
+  }
+
+  /** Finds a ValueSet supplied inline via a tx-resource parameter whose url matches the requested url. */
+  private static com.kodality.zmei.fhir.resource.terminology.ValueSet findTxResourceValueSet(Parameters req, String url) {
+    return txResourceValueSets(req, url).stream().findFirst().orElse(null);
+  }
+
+  /** All ValueSets supplied inline via tx-resource params whose canonical url matches (any version). */
+  private static List<com.kodality.zmei.fhir.resource.terminology.ValueSet> txResourceValueSets(Parameters req, String url) {
+    if (req.getParameter() == null || url == null) {
+      return List.of();
+    }
+    return req.getParameter().stream()
+        .filter(p -> "tx-resource".equals(p.getName()))
+        .map(ParametersParameter::getResource)
+        .filter(r -> r instanceof com.kodality.zmei.fhir.resource.terminology.ValueSet)
+        .map(r -> (com.kodality.zmei.fhir.resource.terminology.ValueSet) r)
+        .filter(vs -> url.equals(vs.getUrl()))
+        .toList();
+  }
+
+  private static final String STANDARDS_STATUS_URL = "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status";
+  private static final String VALUESET_DEPRECATED_URL = "http://hl7.org/fhir/StructureDefinition/valueset-deprecated";
+
+  /** The tx-resource CodeSystem whose canonical url matches {@code system}. */
+  private static com.kodality.zmei.fhir.resource.terminology.CodeSystem txCodeSystem(Parameters req, String system) {
+    if (req == null || req.getParameter() == null || system == null) {
+      return null;
+    }
+    return req.getParameter().stream().filter(p -> "tx-resource".equals(p.getName()))
+        .map(ParametersParameter::getResource).filter(r -> r instanceof com.kodality.zmei.fhir.resource.terminology.CodeSystem)
+        .map(r -> (com.kodality.zmei.fhir.resource.terminology.CodeSystem) r)
+        .filter(cs -> system.equals(cs.getUrl())).findFirst().orElse(null);
+  }
+
+  /**
+   * Resolve {@code compose.include/exclude} property {@code =} filters against a tx-resource CodeSystem in Java,
+   * for properties the code system does NOT declare in its {@code property} list. The SQL expand can only filter
+   * on declared/stored properties, so an undeclared concept property (e.g. an inline {@code notSelectable}) yields
+   * nothing; here the matching concepts are computed from the tx-resource CodeSystem and the filter is rewritten to
+   * the explicit concept list. Includes whose filters are all declared (or non-{@code =}) are left to the SQL path.
+   */
+  private void resolveTxResourceFilters(com.kodality.zmei.fhir.resource.terminology.ValueSet vs, Parameters req) {
+    if (vs.getCompose() == null) {
+      return;
+    }
+    resolveTxResourceFilters(vs.getCompose().getInclude(), req);
+    resolveTxResourceFilters(vs.getCompose().getExclude(), req);
+  }
+
+  private void resolveTxResourceFilters(
+      List<com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetComposeInclude> includes, Parameters req) {
+    if (includes == null) {
+      return;
+    }
+    for (var inc : includes) {
+      if (inc.getSystem() == null || inc.getFilter() == null || inc.getFilter().isEmpty()) {
+        continue;
+      }
+      com.kodality.zmei.fhir.resource.terminology.CodeSystem cs = txCodeSystem(req, inc.getSystem());
+      if (cs == null) {
+        continue;
+      }
+      java.util.Set<String> declared = cs.getProperty() == null ? java.util.Set.of()
+          : cs.getProperty().stream().map(com.kodality.zmei.fhir.resource.terminology.CodeSystem.CodeSystemProperty::getCode)
+              .collect(java.util.stream.Collectors.toSet());
+      // Only rewrite when EVERY filter is an `=` filter on an UNDECLARED property — a declared property is handled
+      // by SQL, and mixing leaves the include to the SQL path to avoid double-resolving.
+      boolean allUndeclaredEq = inc.getFilter().stream().allMatch(f ->
+          "=".equals(f.getOp()) && f.getProperty() != null && !declared.contains(f.getProperty()));
+      if (!allUndeclaredEq) {
+        continue;
+      }
+      List<String> codes = new java.util.ArrayList<>();
+      collectFilterMatches(cs.getConcept(), inc.getFilter(), codes);
+      if (codes.isEmpty()) {
+        continue; // nothing matched — leave to SQL (which also yields none) rather than emit a system-wide include
+      }
+      inc.setFilter(null);
+      inc.setConcept(codes.stream().distinct()
+          .map(c -> new com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetComposeIncludeConcept().setCode(c))
+          .toList());
+    }
+  }
+
+  /** Codes (recursively) whose concept satisfies ALL the given property {@code =} filters by their concept property values. */
+  private static void collectFilterMatches(List<com.kodality.zmei.fhir.resource.terminology.CodeSystem.CodeSystemConcept> concepts,
+      List<com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetComposeIncludeFilter> filters, List<String> out) {
+    if (concepts == null) {
+      return;
+    }
+    for (var c : concepts) {
+      if (c.getCode() != null && filters.stream().allMatch(f -> conceptPropertyEquals(c, f.getProperty(), f.getValue()))) {
+        out.add(c.getCode());
+      }
+      collectFilterMatches(c.getConcept(), filters, out);
+    }
+  }
+
+  /** True when the concept carries a property {@code code} whose value (boolean/code/string) equals {@code value}. */
+  private static boolean conceptPropertyEquals(com.kodality.zmei.fhir.resource.terminology.CodeSystem.CodeSystemConcept c,
+      String code, String value) {
+    if (c.getProperty() == null || code == null || value == null) {
+      return false;
+    }
+    return c.getProperty().stream().filter(p -> code.equals(p.getCode())).anyMatch(p -> {
+      String v = p.getValueBoolean() != null ? String.valueOf(p.getValueBoolean())
+          : p.getValueCode() != null ? p.getValueCode()
+          : p.getValueString() != null ? p.getValueString()
+          : p.getValueInteger() != null ? String.valueOf(p.getValueInteger()) : null;
+      return value.equals(v);
+    });
+  }
+
+  private static String statusWarning(com.kodality.zmei.fhir.resource.terminology.CodeSystem cs) {
+    return cs == null ? null : statusWarning(cs.getExperimental(), cs.getStatus(), standardsStatus(cs.getExtensions(STANDARDS_STATUS_URL)));
+  }
+
+  private static String statusWarning(com.kodality.zmei.fhir.resource.terminology.ValueSet vs) {
+    // A value set contributes only its standards-status (deprecated/withdrawn) — NOT draft/experimental, which
+    // are routine for value sets and not warned (only code systems warn on those).
+    if (vs == null) {
+      return null;
+    }
+    String ss = standardsStatus(vs.getExtensions(STANDARDS_STATUS_URL));
+    return "withdrawn".equals(ss) ? "warning-withdrawn" : "deprecated".equals(ss) ? "warning-deprecated" : null;
+  }
+
+  private static String standardsStatus(java.util.stream.Stream<com.kodality.zmei.fhir.Extension> exts) {
+    return exts == null ? null : exts.map(com.kodality.zmei.fhir.Extension::getValueCode).filter(java.util.Objects::nonNull).findFirst().orElse(null);
+  }
+
+  /** The expansion `warning-<status>` parameter name for a non-active resource (withdrawn/deprecated standards-status, experimental, draft, retired), or null. */
+  private static String statusWarning(Boolean experimental, String status, String standardsStatus) {
+    if ("withdrawn".equals(standardsStatus)) {
+      return "warning-withdrawn";
+    }
+    if ("deprecated".equals(standardsStatus)) {
+      return "warning-deprecated";
+    }
+    if (Boolean.TRUE.equals(experimental)) {
+      return "warning-experimental";
+    }
+    if ("draft".equals(status)) {
+      return "warning-draft";
+    }
+    if ("retired".equals(status)) {
+      return "warning-retired";
+    }
+    return null;
+  }
+
+  /** {@code system|code} of concepts the tx-resource CodeSystems mark inactive (property {@code inactive=true} or {@code status} of retired/deprecated/inactive). */
+  private static java.util.Set<String> txInactiveCodes(Parameters req) {
+    java.util.Set<String> codes = new java.util.HashSet<>();
+    if (req == null || req.getParameter() == null) {
+      return codes;
+    }
+    for (ParametersParameter p : req.getParameter()) {
+      if ("tx-resource".equals(p.getName()) && p.getResource() instanceof com.kodality.zmei.fhir.resource.terminology.CodeSystem cs && cs.getUrl() != null) {
+        collectInactive(cs.getConcept(), cs.getUrl(), codes);
+      }
+    }
+    return codes;
+  }
+
+  /** {@code system|code} of concepts the tx-resource CodeSystems mark not-selectable (property {@code notSelectable=true}). */
+  private static java.util.Set<String> txAbstractCodes(Parameters req) {
+    java.util.Set<String> codes = new java.util.HashSet<>();
+    if (req == null || req.getParameter() == null) {
+      return codes;
+    }
+    for (ParametersParameter p : req.getParameter()) {
+      if ("tx-resource".equals(p.getName()) && p.getResource() instanceof com.kodality.zmei.fhir.resource.terminology.CodeSystem cs && cs.getUrl() != null) {
+        collectAbstract(cs.getConcept(), cs.getUrl(), codes);
+      }
+    }
+    return codes;
+  }
+
+  private static void collectAbstract(List<com.kodality.zmei.fhir.resource.terminology.CodeSystem.CodeSystemConcept> concepts, String system, java.util.Set<String> codes) {
+    if (concepts == null) {
+      return;
+    }
+    for (var c : concepts) {
+      if (c.getCode() != null && c.getProperty() != null && c.getProperty().stream()
+          .anyMatch(pr -> ("notSelectable".equals(pr.getCode()) || "not-selectable".equals(pr.getCode())) && Boolean.TRUE.equals(pr.getValueBoolean()))) {
+        codes.add(system + "|" + c.getCode());
+      }
+      collectAbstract(c.getConcept(), system, codes);
+    }
+  }
+
+  private static void collectInactive(List<com.kodality.zmei.fhir.resource.terminology.CodeSystem.CodeSystemConcept> concepts, String system, java.util.Set<String> codes) {
+    if (concepts == null) {
+      return;
+    }
+    for (var c : concepts) {
+      if (c.getCode() != null && c.getProperty() != null && c.getProperty().stream().anyMatch(pr ->
+          ("inactive".equals(pr.getCode()) && Boolean.TRUE.equals(pr.getValueBoolean()))
+              || ("status".equals(pr.getCode()) && List.of("retired", "deprecated", "inactive").contains(String.valueOf(pr.getValueCode()))))) {
+        codes.add(system + "|" + c.getCode());
+      }
+      collectInactive(c.getConcept(), system, codes);
+    }
+  }
+
+  /** Canonical urls of tx-resource CodeSystems that declare no version (so a used-codesystem should be the bare system uri). */
+  private static java.util.Set<String> versionlessTxCodeSystems(Parameters req) {
+    java.util.Set<String> systems = new java.util.HashSet<>();
+    if (req == null || req.getParameter() == null) {
+      return systems;
+    }
+    for (ParametersParameter p : req.getParameter()) {
+      if ("tx-resource".equals(p.getName()) && p.getResource() instanceof com.kodality.zmei.fhir.resource.terminology.CodeSystem cs
+          && cs.getUrl() != null && StringUtils.isEmpty(cs.getVersion())) {
+        systems.add(cs.getUrl());
+      }
+    }
+    return systems;
+  }
+
+  /** Versions of the CodeSystem(s) supplied inline via tx-resource params whose canonical url matches {@code system}. */
+  private static List<String> txResourceCodeSystemVersions(Parameters req, String system) {
+    if (req == null || req.getParameter() == null || system == null) {
+      return List.of();
+    }
+    return req.getParameter().stream()
+        .filter(p -> "tx-resource".equals(p.getName()))
+        .map(ParametersParameter::getResource)
+        .filter(r -> r instanceof com.kodality.zmei.fhir.resource.terminology.CodeSystem)
+        .map(r -> ((com.kodality.zmei.fhir.resource.terminology.CodeSystem) r))
+        .filter(cs -> system.equals(cs.getUrl()))
+        .map(com.kodality.zmei.fhir.resource.terminology.CodeSystem::getVersion)
+        .filter(java.util.Objects::nonNull).distinct().toList();
+  }
+
+  /** The {@code <version>} of a {@code system-version}/{@code force-system-version}/{@code check-system-version} param naming {@code system}. */
+  private static String overrideVersion(Parameters req, String name, String system) {
+    if (req == null || req.getParameter() == null || system == null) {
+      return null;
+    }
+    String prefix = system + "|";
+    return req.getParameter().stream()
+        .filter(p -> name.equalsIgnoreCase(p.getName()))
+        .map(p -> p.getValueCanonical() != null ? p.getValueCanonical() : p.getValueString())
+        .filter(v -> v != null && v.startsWith(prefix))
+        .map(v -> v.substring(prefix.length()))
+        .findFirst().orElse(null);
+  }
+
+  /**
+   * Returns a copy of the inline value set with each {@code compose.include.version} resolved to a concrete
+   * available code system version: {@code force-system-version} overrides; else the include version; else
+   * {@code system-version}; else {@code check-system-version}; a wildcard ({@code 1.x.x}) resolves to the
+   * highest matching available version. A pinned version that resolves to nothing, or a resolved version that
+   * fails {@code check-system-version}, is a 4xx — the expansion can't be produced. The original is untouched.
+   */
+  private com.kodality.zmei.fhir.resource.terminology.ValueSet resolveIncludeVersions(
+      com.kodality.zmei.fhir.resource.terminology.ValueSet inlineVs, Parameters req) {
+    if (inlineVs.getCompose() == null || inlineVs.getCompose().getInclude() == null) {
+      return inlineVs;
+    }
+    com.kodality.zmei.fhir.resource.terminology.ValueSet copy = FhirMapper.fromJson(
+        FhirMapper.toJson(inlineVs), com.kodality.zmei.fhir.resource.terminology.ValueSet.class);
+    for (var inc : copy.getCompose().getInclude()) {
+      String system = inc.getSystem();
+      if (system == null) {
+        continue;
+      }
+      List<String> available = txResourceCodeSystemVersions(req, system);
+      String force = overrideVersion(req, "force-system-version", system);
+      String check = overrideVersion(req, "check-system-version", system);
+      String resolved = inc.getVersion();
+      if (force != null) {
+        resolved = force;
+      } else if (StringUtils.isEmpty(resolved)) {
+        String def = overrideVersion(req, "system-version", system);
+        resolved = def != null ? def : check;
+      }
+      if (resolved == null) {
+        continue; // versionless — let the SQL expand the latest
+      }
+      String pattern = resolved;
+      String concrete = org.termx.terminology.fhir.FhirVersions.versionHasWildcards(pattern)
+          ? available.stream().filter(a -> org.termx.terminology.fhir.FhirVersions.versionMatches(pattern, a))
+              .max(ValueSetExpandOperation::compareVersions).orElse(null)
+          : available.contains(pattern) ? pattern : null;
+      if (concrete == null) {
+        if (!available.isEmpty()) {
+          throw org.termx.terminology.fhir.TxIssues.notFoundException(404, String.format(
+              "A definition for CodeSystem '%s' version '%s' could not be found, so the value set cannot be expanded. Valid versions: %s",
+              system, resolved, org.termx.terminology.fhir.TxIssues.presentVersionList(available)));
+        }
+        continue;
+      }
+      if (check != null && !org.termx.terminology.fhir.FhirVersions.versionMatches(check, concrete)) {
+        throw org.termx.terminology.fhir.TxIssues.versionCheckException(400, String.format(
+            "The version '%s' is not allowed for system '%s': required to be '%s' by a version-check parameter", concrete, system, check));
+      }
+      inc.setVersion(concrete);
+    }
+    return copy;
+  }
+
+  /**
+   * P8 — resolve {@code compose.include[].valueSet} (imported value sets). The SQL expand only handles
+   * {@code system}/{@code concept}/{@code filter}; an imported value set is expanded here (recursively, from the
+   * bundled tx-resources) and its members rewritten into the include as {@code system}+{@code concept} entries,
+   * so the rest of the pipeline (SQL expand, flags, display) handles them. A referenced value set that cannot be
+   * resolved — e.g. a wrong pinned {@code url|version} — is a 4xx not-found. {@code visited} guards import cycles.
+   */
+  private com.kodality.zmei.fhir.resource.terminology.ValueSet resolveImportedValueSets(
+      com.kodality.zmei.fhir.resource.terminology.ValueSet inlineVs, Parameters req, java.util.Set<String> visited,
+      List<String> usedValueSets) {
+    if (inlineVs.getCompose() == null || inlineVs.getCompose().getInclude() == null
+        || inlineVs.getCompose().getInclude().stream().noneMatch(i -> (i.getValueSet() != null && !i.getValueSet().isEmpty()))) {
+      return inlineVs;
+    }
+    com.kodality.zmei.fhir.resource.terminology.ValueSet copy = FhirMapper.fromJson(
+        FhirMapper.toJson(inlineVs), com.kodality.zmei.fhir.resource.terminology.ValueSet.class);
+    List<com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetComposeInclude> newIncludes = new java.util.ArrayList<>();
+    for (var inc : copy.getCompose().getInclude()) {
+      if ((inc.getValueSet() == null || inc.getValueSet().isEmpty())) {
+        newIncludes.add(inc);
+        continue;
+      }
+      // Members of each imported value set, grouped by code system uri (preserving order), collected per ref so
+      // that an include referencing MORE THAN ONE value set yields their INTERSECTION (a code must be in all of
+      // them), not their union.
+      List<java.util.LinkedHashMap<String, java.util.LinkedHashSet<String>>> perRefMembers = new java.util.ArrayList<>();
+      for (String ref : inc.getValueSet()) {
+        java.util.LinkedHashMap<String, java.util.LinkedHashSet<String>> bySystem = new java.util.LinkedHashMap<>();
+        perRefMembers.add(bySystem);
+        // A contained value set reference (#id) resolves from the operation value set's `contained` resources,
+        // then expands like any imported value set (recursively, members folded into the include by system).
+        if (ref != null && ref.startsWith("#")) {
+          String containedId = ref.substring(1);
+          com.kodality.zmei.fhir.resource.terminology.ValueSet containedVs = java.util.Optional.ofNullable(inlineVs.getContained()).orElse(List.of()).stream()
+              .filter(r -> r instanceof com.kodality.zmei.fhir.resource.terminology.ValueSet)
+              .map(r -> (com.kodality.zmei.fhir.resource.terminology.ValueSet) r)
+              .filter(cvs -> containedId.equals(cvs.getId()))
+              .findFirst().orElse(null);
+          if (containedVs == null) {
+            throw org.termx.terminology.fhir.TxIssues.notFoundException(404, "Unable to resolve the contained value set " + ref);
+          }
+          if (!visited.add(ref)) {
+            continue; // guard against import cycles
+          }
+          com.kodality.zmei.fhir.resource.terminology.ValueSet resolvedContained =
+              resolveIncludeVersions(resolveImportedValueSets(containedVs, req, visited, usedValueSets), req);
+          for (ValueSetVersionConcept m : valueSetVersionConceptRepository.expandFromJson(FhirMapper.toJson(resolvedContained))) {
+            if (m.getConcept() == null || m.getConcept().getCode() == null) {
+              continue;
+            }
+            String sys = m.getConcept().getCodeSystemUri() != null ? m.getConcept().getCodeSystemUri() : m.getConcept().getBaseCodeSystemUri();
+            if (sys != null) {
+              bySystem.computeIfAbsent(sys, k -> new java.util.LinkedHashSet<>()).add(m.getConcept().getCode());
+            }
+          }
+          continue;
+        }
+        int pipe = ref.indexOf('|');
+        String refUrl = pipe >= 0 ? ref.substring(0, pipe) : ref;
+        // The import ref's own pinned version wins; otherwise a `default-valueset-version` request param for this
+        // url pins it (a wrong/absent version then resolves to nothing → 4xx below).
+        String refVersion = pipe >= 0 ? ref.substring(pipe + 1) : defaultValueSetVersion(req, refUrl);
+        com.kodality.zmei.fhir.resource.terminology.ValueSet imported = txResourceValueSets(req, refUrl).stream()
+            .filter(vs -> refVersion == null || refVersion.equals(vs.getVersion()))
+            .max(java.util.Comparator.comparing(com.kodality.zmei.fhir.resource.terminology.ValueSet::getVersion,
+                java.util.Comparator.nullsFirst(ValueSetExpandOperation::compareVersions)))
+            .orElse(null);
+        if (imported == null) {
+          // Not bundled inline as a tx-resource — fall back to a value set the server already stores under this
+          // canonical (a compose may import a standard/registered value set, e.g. the FHIR administrative-gender
+          // value set, that the request doesn't re-send). Expand the stored version through the snapshot path and
+          // fold its members in, so a mixed include/exclude that references a stored import resolves instead of 404ing.
+          ValueSetQueryParams storedParams = new ValueSetQueryParams();
+          storedParams.setUri(refUrl);
+          storedParams.setLimit(1);
+          // No VS_READ filter here: this is a TRANSITIVE import resolved inside an expansion the caller already
+          // initiated, not a direct read. A compose routinely imports standard/registered value sets (e.g. the
+          // FHIR core administrative-gender value set) that the caller has no explicit grant for; the reference
+          // tx server resolves them, and the import surfaces only as expansion members. Filtering by the caller's
+          // permitted ids here 404s every such import (the import's content is never exposed as a readable resource).
+          ValueSet storedVs = valueSetService.query(storedParams).findFirst().orElse(null);
+          ValueSetVersion storedVersion = null;
+          if (storedVs != null) {
+            if (refVersion != null) {
+              ValueSetVersionQueryParams svParams = new ValueSetVersionQueryParams();
+              svParams.setValueSet(storedVs.getId());
+              svParams.setVersion(refVersion);
+              svParams.setLimit(1);
+              storedVersion = valueSetVersionService.query(svParams).findFirst().orElse(null);
+            } else {
+              storedVersion = valueSetVersionService.loadLastVersion(storedVs.getId());
+            }
+          }
+          if (storedVersion == null) {
+            throw org.termx.terminology.fhir.TxIssues.notFoundException(404,
+                "Unable to resolve the value set import " + refUrl + (refVersion != null ? "|" + refVersion : ""));
+          }
+          usedValueSets.add(refUrl + (storedVersion.getVersion() != null ? "|" + storedVersion.getVersion() : ""));
+          if (!visited.add(refUrl + "|" + (storedVersion.getVersion() == null ? "" : storedVersion.getVersion()))) {
+            continue; // already expanded on this path — guard against import cycles
+          }
+          for (ValueSetVersionConcept m : valueSetVersionConceptService.expand(storedVs.getId(), storedVersion.getVersion(), "en", false).getExpansion()) {
+            if (m.getConcept() == null || m.getConcept().getCode() == null) {
+              continue;
+            }
+            String sys = m.getConcept().getCodeSystemUri() != null ? m.getConcept().getCodeSystemUri() : m.getConcept().getBaseCodeSystemUri();
+            if (sys != null) {
+              bySystem.computeIfAbsent(sys, k -> new java.util.LinkedHashSet<>()).add(m.getConcept().getCode());
+            }
+          }
+          continue;
+        }
+        // Report the resolved imported value set as a `used-valueset` expansion parameter (url|version).
+        usedValueSets.add(refUrl + (imported.getVersion() != null ? "|" + imported.getVersion() : ""));
+        if (!visited.add(refUrl + "|" + (imported.getVersion() == null ? "" : imported.getVersion()))) {
+          continue; // already expanded on this path — guard against import cycles
+        }
+        com.kodality.zmei.fhir.resource.terminology.ValueSet resolved =
+            resolveIncludeVersions(resolveImportedValueSets(imported, req, visited, usedValueSets), req);
+        for (ValueSetVersionConcept m : valueSetVersionConceptRepository.expandFromJson(FhirMapper.toJson(resolved))) {
+          if (m.getConcept() == null || m.getConcept().getCode() == null) {
+            continue;
+          }
+          String sys = m.getConcept().getCodeSystemUri() != null ? m.getConcept().getCodeSystemUri() : m.getConcept().getBaseCodeSystemUri();
+          if (sys != null) {
+            bySystem.computeIfAbsent(sys, k -> new java.util.LinkedHashSet<>()).add(m.getConcept().getCode());
+          }
+        }
+      }
+      // Combine the per-ref member maps: a single referenced value set contributes its members directly; multiple
+      // referenced value sets contribute their intersection (a code present in EVERY one).
+      java.util.LinkedHashMap<String, java.util.LinkedHashSet<String>> bySystem = intersectImportedMembers(perRefMembers);
+      boolean hasConcepts = inc.getConcept() != null && !inc.getConcept().isEmpty();
+      boolean hasFilter = inc.getFilter() != null && !inc.getFilter().isEmpty();
+      boolean pureImport = inc.getSystem() == null && !hasConcepts && !hasFilter;
+      if (hasConcepts && !hasFilter && inc.getSystem() != null) {
+        // Mixed include: explicit concepts AND value-set import(s). FHIR expansion is the INTERSECTION — only the
+        // listed concepts that are ALSO members of the imported value set(s) survive (not the union of both). So
+        // restrict the concept list to the imported members and DON'T fold the imports in as their own members.
+        java.util.Set<String> importedCodes = bySystem.getOrDefault(inc.getSystem(), new java.util.LinkedHashSet<>());
+        var intersected = new com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetComposeInclude();
+        intersected.setSystem(inc.getSystem());
+        intersected.setVersion(inc.getVersion());
+        intersected.setConcept(inc.getConcept().stream().filter(c -> importedCodes.contains(c.getCode())).toList());
+        newIncludes.add(intersected);
+      } else {
+        // A pure-import include (only valueSet) is replaced by the imported members; a system-only or filter-based
+        // mixed include keeps its own selection alongside the imported members.
+        if (!pureImport) {
+          newIncludes.add(inc);
+        }
+        bySystem.forEach((sys, codes) -> {
+          var imp = new com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetComposeInclude();
+          imp.setSystem(sys);
+          imp.setConcept(codes.stream()
+              .map(c -> new com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetComposeIncludeConcept().setCode(c)).toList());
+          newIncludes.add(imp);
+        });
+      }
+    }
+    copy.getCompose().setInclude(newIncludes);
+    return copy;
+  }
+
+  /**
+   * Combines the per-referenced-value-set member maps of one include. A single reference contributes its members
+   * directly; multiple references contribute their INTERSECTION — a (system, code) survives only when present in
+   * every referenced value set (FHIR: an include with several {@code valueSet}s requires membership in all).
+   */
+  private static java.util.LinkedHashMap<String, java.util.LinkedHashSet<String>> intersectImportedMembers(
+      List<java.util.LinkedHashMap<String, java.util.LinkedHashSet<String>>> perRefMembers) {
+    if (perRefMembers.isEmpty()) {
+      return new java.util.LinkedHashMap<>();
+    }
+    if (perRefMembers.size() == 1) {
+      return perRefMembers.get(0);
+    }
+    java.util.LinkedHashMap<String, java.util.LinkedHashSet<String>> result = new java.util.LinkedHashMap<>();
+    for (var entry : perRefMembers.get(0).entrySet()) {
+      java.util.LinkedHashSet<String> codes = new java.util.LinkedHashSet<>(entry.getValue());
+      for (int i = 1; i < perRefMembers.size(); i++) {
+        java.util.LinkedHashSet<String> other = perRefMembers.get(i).get(entry.getKey());
+        if (other == null) {
+          codes.clear();
+          break;
+        }
+        codes.retainAll(other);
+      }
+      if (!codes.isEmpty()) {
+        result.put(entry.getKey(), codes);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Rejects a value set that cannot be processed because a {@code compose.include}/{@code exclude} filter is
+   * missing its {@code value} (1..1 in R5) — a 4xx {@code vs-invalid} carrying the offending filter's location,
+   * the way org.hl7.fhir.core does (tx-ecosystem {@code errors/broken-filter}). Only the operation target is
+   * checked; a malformed bundled tx-resource is tolerated on the input path.
+   */
+  private void requireValidFilters(com.kodality.zmei.fhir.resource.terminology.ValueSet vs) {
+    if (vs == null || vs.getCompose() == null) {
+      return;
+    }
+    requireValidFilters(vs.getCompose().getInclude(), "include");
+    requireValidFilters(vs.getCompose().getExclude(), "exclude");
+  }
+
+  private void requireValidFilters(
+      List<com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetComposeInclude> includes, String kind) {
+    if (includes == null) {
+      return;
+    }
+    for (int i = 0; i < includes.size(); i++) {
+      var inc = includes.get(i);
+      if (inc.getFilter() == null) {
+        continue;
+      }
+      for (int j = 0; j < inc.getFilter().size(); j++) {
+        var f = inc.getFilter().get(j);
+        if (StringUtils.isEmpty(f.getValue())) {
+          throw org.termx.terminology.fhir.TxIssues.vsInvalidException(400,
+              String.format("The system %s filter with property = %s, op = %s has no value", inc.getSystem(), f.getProperty(), f.getOp()),
+              String.format("ValueSet.compose.%s[%d].filter[%d]", kind, i, j));
+        }
+      }
+    }
+  }
+
+  /**
+   * A value set that declares a REQUIRED supplement via the {@code valueset-supplement} extension must have it
+   * resolvable — a bundled tx-resource CodeSystem or a stored one with that canonical url. An unresolvable
+   * required supplement is a 404 not-found (tx-ecosystem {@code extensions} bad-supplement cases).
+   */
+  private void requireDeclaredSupplements(com.kodality.zmei.fhir.resource.terminology.ValueSet vs, Parameters req) {
+    if (vs == null || vs.getExtension() == null) {
+      return;
+    }
+    for (com.kodality.zmei.fhir.Extension ext : vs.getExtension()) {
+      if (!"http://hl7.org/fhir/StructureDefinition/valueset-supplement".equals(ext.getUrl())) {
+        continue;
+      }
+      String ref = ext.getValueCanonical() != null ? ext.getValueCanonical()
+          : ext.getValueUri() != null ? ext.getValueUri() : ext.getValueUrl();
+      if (StringUtils.isEmpty(ref)) {
+        continue;
+      }
+      String url = ref.contains("|") ? ref.substring(0, ref.indexOf('|')) : ref;
+      boolean txPresent = req != null && req.getParameter() != null && req.getParameter().stream()
+          .filter(p -> "tx-resource".equals(p.getName()))
+          .map(ParametersParameter::getResource)
+          .filter(r -> r instanceof com.kodality.zmei.fhir.resource.terminology.CodeSystem)
+          .map(r -> ((com.kodality.zmei.fhir.resource.terminology.CodeSystem) r).getUrl())
+          .anyMatch(url::equals);
+      boolean storedPresent = !txPresent && codeSystemService.query(
+          new org.termx.ts.codesystem.CodeSystemQueryParams().setUri(url).limit(1)).findFirst().isPresent();
+      if (!txPresent && !storedPresent) {
+        throw org.termx.terminology.fhir.TxIssues.notFoundException(404, "Required supplement not found: " + ref);
+      }
+    }
+  }
+
+  /** The version pinned for an imported value set by a {@code default-valueset-version} request param
+   *  ({@code <vsUrl>|<version>}), or null. */
+  private static String defaultValueSetVersion(Parameters req, String vsUrl) {
+    if (req == null || req.getParameter() == null) {
+      return null;
+    }
+    return req.getParameter().stream()
+        .filter(p -> "default-valueset-version".equals(p.getName()))
+        .map(p -> p.getValueCanonical() != null ? p.getValueCanonical() : p.getValueUri() != null ? p.getValueUri() : p.getValueString())
+        .filter(java.util.Objects::nonNull)
+        .filter(v -> v.startsWith(vsUrl + "|"))
+        .map(v -> v.substring(vsUrl.length() + 1))
+        .findFirst().orElse(null);
+  }
+
+  /** Highest-version tx-resource (latest, by numeric-aware dotted-version order), falling back to the first. */
+  private static com.kodality.zmei.fhir.resource.terminology.ValueSet latestByVersion(
+      List<com.kodality.zmei.fhir.resource.terminology.ValueSet> vss) {
+    return vss.stream().max(java.util.Comparator.comparing(
+        com.kodality.zmei.fhir.resource.terminology.ValueSet::getVersion,
+        java.util.Comparator.nullsFirst(ValueSetExpandOperation::compareVersions))).orElse(vss.get(0));
+  }
+
+  /** Numeric-aware comparison of dotted version strings ("1.10.0" &gt; "1.2.0"), tolerant of non-numeric parts. */
+  private static int compareVersions(String a, String b) {
+    String[] pa = a.split("\\.");
+    String[] pb = b.split("\\.");
+    for (int i = 0; i < Math.max(pa.length, pb.length); i++) {
+      String sa = i < pa.length ? pa[i] : "0";
+      String sb = i < pb.length ? pb[i] : "0";
+      int c = sa.matches("\\d+") && sb.matches("\\d+") ? Long.compare(Long.parseLong(sa), Long.parseLong(sb)) : sa.compareTo(sb);
+      if (c != 0) {
+        return c;
+      }
+    }
+    return 0;
+  }
+
+  /** The resolved code system version on an expanded member (the first {@code codeSystemVersions}), or null. */
+  private static String memberVersion(ValueSetVersionConcept c) {
+    return c.getConcept() != null && c.getConcept().getCodeSystemVersions() != null
+        ? c.getConcept().getCodeSystemVersions().stream().findFirst().orElse(null) : null;
+  }
+
+  /** Systems referenced by the compose (include or exclude) at two or more distinct, concrete versions. */
+  private static java.util.Set<String> multiVersionSystems(com.kodality.zmei.fhir.resource.terminology.ValueSet vs) {
+    if (vs == null || vs.getCompose() == null) {
+      return java.util.Set.of();
+    }
+    java.util.Map<String, java.util.Set<String>> sysVersions = new java.util.HashMap<>();
+    java.util.stream.Stream.concat(
+            java.util.Optional.ofNullable(vs.getCompose().getInclude()).orElse(List.of()).stream(),
+            java.util.Optional.ofNullable(vs.getCompose().getExclude()).orElse(List.of()).stream())
+        .filter(inc -> inc.getSystem() != null && StringUtils.isNotEmpty(inc.getVersion()))
+        .forEach(inc -> sysVersions.computeIfAbsent(inc.getSystem(), k -> new java.util.HashSet<>()).add(inc.getVersion()));
+    return sysVersions.entrySet().stream().filter(e -> e.getValue().size() >= 2).map(java.util.Map.Entry::getKey)
+        .collect(java.util.stream.Collectors.toSet());
+  }
+
+  /** A {@code compose.extension[valueset-expansion-parameter]} value by parameter name (e.g. {@code versionsMatch}). */
+  private static String vsExpansionParameterValue(com.kodality.zmei.fhir.resource.terminology.ValueSet vs, String parameter) {
+    if (vs == null || vs.getCompose() == null || vs.getCompose().getExtension() == null) {
+      return null;
+    }
+    for (com.kodality.zmei.fhir.Extension ext : vs.getCompose().getExtension()) {
+      if (!"http://hl7.org/fhir/StructureDefinition/valueset-expansion-parameter".equals(ext.getUrl()) || ext.getExtension() == null) {
+        continue;
+      }
+      String name = ext.getExtension().stream().filter(e -> "name".equals(e.getUrl()))
+          .map(e -> e.getValueString() != null ? e.getValueString() : e.getValueCode()).filter(java.util.Objects::nonNull).findFirst().orElse(null);
+      if (parameter.equals(name)) {
+        return ext.getExtension().stream().filter(e -> "value".equals(e.getUrl()))
+            .map(e -> e.getValueString() != null ? e.getValueString() : e.getValueCode()).filter(java.util.Objects::nonNull).findFirst().orElse(null);
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Codes ({@code system|code}) selected by the compose's WHOLE-version EXCLUDE blocks (system+version, no concept
+   * and no filter) for the given systems, resolved version-agnostically. An enumerated/filtered exclude is left to
+   * the SQL path (it is version-specific); only a whole-version exclude removes the shared code across versions.
+   */
+  private java.util.Set<String> resolveExcludeCodes(com.kodality.zmei.fhir.resource.terminology.ValueSet vs, java.util.Set<String> systems) {
+    List<com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetComposeInclude> wholeVersionExcludes =
+        java.util.Optional.ofNullable(vs.getCompose().getExclude()).orElse(List.of()).stream()
+            .filter(ex -> ex.getSystem() != null && systems.contains(ex.getSystem())
+                && (ex.getConcept() == null || ex.getConcept().isEmpty()) && (ex.getFilter() == null || ex.getFilter().isEmpty()))
+            .toList();
+    if (wholeVersionExcludes.isEmpty()) {
+      return java.util.Set.of();
+    }
+    com.kodality.zmei.fhir.resource.terminology.ValueSet probe = new com.kodality.zmei.fhir.resource.terminology.ValueSet();
+    com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetCompose compose =
+        new com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetCompose();
+    compose.setInclude(wholeVersionExcludes);
+    probe.setCompose(compose);
+    java.util.Set<String> codes = new java.util.HashSet<>();
+    for (ValueSetVersionConcept m : valueSetVersionConceptRepository.expandFromJson(FhirMapper.toJson(probe))) {
+      if (m.getConcept() != null && systems.contains(m.getConcept().getCodeSystemUri())) {
+        codes.add(m.getConcept().getCodeSystemUri() + "|" + m.getConcept().getCode());
+      }
+    }
+    return codes;
   }
 
   private com.kodality.zmei.fhir.resource.terminology.ValueSet expandInline(
       com.kodality.zmei.fhir.resource.terminology.ValueSet inlineVs, Parameters req) {
+    // Resolve each compose.include.version against the system-version/force-system-version/check-system-version
+    // params and wildcard semantics (mirrors org.hl7.fhir.core ValueSetValidator.determineVersion), rewriting it
+    // to a concrete available version so the SQL expand picks the right code system version — driving
+    // expansion.total and the used-codesystem parameter. A pinned version that resolves to nothing, or a
+    // check-system-version mismatch, is a 4xx (the expansion can't be produced).
+    // The value set being operated on must be structurally valid: a compose filter is missing its `value`
+    // (1..1 in R5) cannot be processed — reject with a 4xx vs-invalid, the way the reference engine does
+    // (errors/broken-filter). This is the OPERATION TARGET only; a malformed *supporting* tx-resource is
+    // tolerated on the input path (see ProfileTolerantResourceValidator / #283).
+    requireValidFilters(inlineVs);
+    // A value set that REQUIRES a supplement (valueset-supplement extension) must have it resolvable, else 4xx.
+    requireDeclaredSupplements(inlineVs, req);
+
+    // P8: flatten any compose.include[].valueSet (imported value sets) into system+concept includes first.
+    List<String> usedValueSets = new java.util.ArrayList<>();
+    inlineVs = resolveImportedValueSets(inlineVs, req, new java.util.HashSet<>(), usedValueSets);
+    // A value set referenced in an EXCLUDE is also "used" (resolveImportedValueSets only records includes). Its
+    // members are removed by the SQL/exclude path; the reference still reports it as used-valueset. Resolve the
+    // version (pinned ref version, else the bundled tx-resource's, else the stored latest) for the `url|version`.
+    if (inlineVs.getCompose() != null && inlineVs.getCompose().getExclude() != null) {
+      for (var ex : inlineVs.getCompose().getExclude()) {
+        for (String ref : java.util.Optional.ofNullable(ex.getValueSet()).orElse(List.of())) {
+          if (StringUtils.isEmpty(ref)) {
+            continue;
+          }
+          int pipe = ref.indexOf('|');
+          String exUrl = pipe >= 0 ? ref.substring(0, pipe) : ref;
+          String exVer = pipe >= 0 ? ref.substring(pipe + 1) : null;
+          if (exVer == null) {
+            var txVs = txResourceValueSets(req, exUrl).stream().findFirst().orElse(null);
+            exVer = txVs != null ? txVs.getVersion()
+                : java.util.Optional.ofNullable(valueSetVersionService.loadLastVersionByUri(exUrl)).map(ValueSetVersion::getVersion).orElse(null);
+          }
+          String canonical = exUrl + (exVer != null ? "|" + exVer : "");
+          if (!usedValueSets.contains(canonical)) {
+            usedValueSets.add(canonical);
+          }
+        }
+      }
+    }
+    inlineVs = resolveIncludeVersions(inlineVs, req);
+    // Resolve property `=` filters against a tx-resource CodeSystem in Java when the property is NOT declared in
+    // the code system (the SQL expand can only filter on declared/stored properties, so an undeclared concept
+    // property like an inline `notSelectable` yields nothing). Converts the filter to the matching concept list.
+    resolveTxResourceFilters(inlineVs, req);
+
     // Serialize the inline ValueSet to JSON
     String valueSetJson = FhirMapper.toJson(inlineVs);
 
@@ -231,12 +1149,26 @@ public class ValueSetExpandOperation implements InstanceOperationDefinition, Typ
     boolean includeDesignations = req != null && req.findParameter("includeDesignations")
         .map(pr -> pr.getValueBoolean() != null && pr.getValueBoolean() || "true".equals(pr.getValueString()))
         .orElse(false);
+    // FHIR $expand `designation` filter tokens (same semantics as the stored path) — restrict which
+    // designations the inline expansion returns. Empty = return all.
+    List<String> designationFilter = ValueSetFhirMapper.designationFilterTokens(req);
+    // FHIR $expand `property` tokens — which concept properties to surface in contains[].property. The
+    // decorateExpansionFlags step below loads the members' property values, so they are available here.
+    List<String> requestedProperties = designationOrPropertyRequested(req, "property");
+
+    // The SQL expand can't reach external providers (e.g. SNOMED via Snowstorm), so those members arrive
+    // bare. Enrich them with display/designations from the providers, then layer supplements onto the
+    // whole expansion — so a SNOMED-based supplement surfaces in an inline/tx-resource $expand too.
+    enrichExternalMembers(expandedConcepts, displayLanguage);
+    List<org.termx.terminology.terminology.codesystem.concept.ConceptSupplementService.UsedSupplement> usedSupplements =
+        conceptSupplementService.mergeSupplementsIntoExpansion(expandedConcepts, supplementParams(displayLanguage, req));
 
     // Apply FHIR R5 `filter` (free-text typeahead) before pagination, matching
     // the stored-VS path semantics. Filters affect `expansion.total`;
     // pagination does not.
     String textFilter = req == null ? null : req.findParameter("filter")
-        .map(pp -> pp.getValueString() != null ? pp.getValueString() : pp.getValueCode()).orElse(null);
+        .map(pp -> pp.getValueString() != null ? pp.getValueString()
+            : pp.getValueCode() != null ? pp.getValueCode() : pp.getValueUri()).orElse(null);
     if (textFilter != null && !textFilter.isBlank()) {
       String needle = textFilter.toLowerCase();
       expandedConcepts = expandedConcepts.stream().filter(c -> {
@@ -245,6 +1177,76 @@ public class ValueSetExpandOperation implements InstanceOperationDefinition, Typ
         return (code != null && code.toLowerCase().contains(needle))
             || (display != null && display.toLowerCase().contains(needle));
       }).toList();
+    }
+
+    // Exclude inactive (retired/deprecated) members when asked — either the `activeOnly` request parameter,
+    // or the value set's own `compose.inactive = false` (FHIR: inactive codes are excluded unless that flag
+    // is absent/true). This changes the set, so it runs before expansion.total. The SQL expand carries no
+    // status, so the filter needs the decorated version status — decorate the whole (already in-memory) set
+    // up front in this case; the common path decorates only the page below, keeping it page-bounded.
+    boolean activeOnlyParam = req != null && req.findParameter("activeOnly")
+        .map(pp -> Boolean.TRUE.equals(pp.getValueBoolean()) || "true".equals(pp.getValueString())).orElse(false);
+    boolean composeExcludesInactive = inlineVs.getCompose() != null && Boolean.FALSE.equals(inlineVs.getCompose().getInactive());
+    boolean excludeInactive = activeOnlyParam || composeExcludesInactive;
+    // The SQL expand carries no status/properties, and the DB decoration is unreliable for tx-resource-only
+    // code systems — so also derive inactivity straight from the tx-resource CodeSystem's concept properties
+    // (`inactive=true` / `status=retired|deprecated|inactive`).
+    java.util.Set<String> txInactiveCodes = txInactiveCodes(req);
+    java.util.Set<String> txAbstractCodes = txAbstractCodes(req);
+    if (excludeInactive) {
+      decorateExpansionFlags(expandedConcepts);
+      expandedConcepts = expandedConcepts.stream()
+          .filter(c -> !isInactiveMember(c) && !(c.getConcept() != null && txInactiveCodes.contains(c.getConcept().getCodeSystemUri() + "|" + c.getConcept().getCode())))
+          .toList();
+    }
+
+    // Cross-version ("overload") handling: a code system referenced at multiple versions in the compose.
+    java.util.Set<String> multiVersionSystems = multiVersionSystems(inlineVs);
+    boolean versionsMatchApplied = false;
+    if (!multiVersionSystems.isEmpty()) {
+      // The cross-version logic needs each member's resolved code system VERSION, which the SQL expand carries as
+      // a version id only — decorate the full set up front so memberVersion() is populated (idempotent: the page
+      // decoration below skips members already carrying a version).
+      decorateExpansionFlags(expandedConcepts);
+      // Whole-version excludes apply BY CODE across versions (the SQL excludes by system+code+VERSION, leaving a
+      // shared code pinned to a different version in). Enumerated/filtered excludes stay version-specific (SQL), and
+      // an explicit versionsMatch=false keeps every version separate (no cross-version exclude).
+      boolean versionsMatchDisabled = "false".equals(vsExpansionParameterValue(inlineVs, "versionsMatch"));
+      java.util.Set<String> excludedCodes = !versionsMatchDisabled && inlineVs.getCompose() != null && inlineVs.getCompose().getExclude() != null
+          ? resolveExcludeCodes(inlineVs, multiVersionSystems) : java.util.Set.of();
+      if (!excludedCodes.isEmpty()) {
+        int before = expandedConcepts.size();
+        expandedConcepts = expandedConcepts.stream()
+            .filter(c -> c.getConcept() == null || !multiVersionSystems.contains(c.getConcept().getCodeSystemUri())
+                || !excludedCodes.contains(c.getConcept().getCodeSystemUri() + "|" + c.getConcept().getCode()))
+            .toList();
+        versionsMatchApplied = expandedConcepts.size() < before;
+      }
+      // versionsMatch=true compose extension: collapse a multi-version system's members to one per code (highest
+      // version), preserving first-occurrence order.
+      if ("true".equals(vsExpansionParameterValue(inlineVs, "versionsMatch"))) {
+        List<ValueSetVersionConcept> collapsed = new java.util.ArrayList<>();
+        java.util.Map<String, Integer> idxByCode = new java.util.HashMap<>();
+        for (ValueSetVersionConcept c : expandedConcepts) {
+          if (c.getConcept() == null || !multiVersionSystems.contains(c.getConcept().getCodeSystemUri())) {
+            collapsed.add(c);
+            continue;
+          }
+          String key = c.getConcept().getCodeSystemUri() + "|" + c.getConcept().getCode();
+          Integer idx = idxByCode.get(key);
+          if (idx == null) {
+            idxByCode.put(key, collapsed.size());
+            collapsed.add(c);
+          } else if (compareVersions(java.util.Optional.ofNullable(memberVersion(c)).orElse("0"),
+              java.util.Optional.ofNullable(memberVersion(collapsed.get(idx))).orElse("0")) > 0) {
+            collapsed.set(idx, c);
+          }
+        }
+        if (collapsed.size() < expandedConcepts.size()) {
+          versionsMatchApplied = true;
+        }
+        expandedConcepts = collapsed;
+      }
     }
 
     // FHIR R5 ValueSet.expansion.total: "If the number of codes in an expansion
@@ -267,6 +1269,13 @@ public class ValueSetExpandOperation implements InstanceOperationDefinition, Typ
       expandedConcepts = expandedConcepts.stream().limit(count).toList();
     }
 
+    // Decorate the windowed members with the version status / property values the FHIR expansion shape needs
+    // for `inactive`/`abstract` (the SQL expand returns them bare). The exclude-inactive path already
+    // decorated the full set above; here we decorate just the page, keeping the common case page-bounded.
+    if (!excludeInactive) {
+      decorateExpansionFlags(expandedConcepts);
+    }
+
     // Build response ValueSet with expansion
     com.kodality.zmei.fhir.resource.terminology.ValueSet response = new com.kodality.zmei.fhir.resource.terminology.ValueSet();
     response.setUrl(inlineVs.getUrl());
@@ -274,43 +1283,877 @@ public class ValueSetExpandOperation implements InstanceOperationDefinition, Typ
     response.setName(inlineVs.getName());
     response.setTitle(inlineVs.getTitle());
     response.setStatus(inlineVs.getStatus());
-    response.setCompose(inlineVs.getCompose());
+    // Echo `experimental` from the source — the tx-ecosystem expects it on the $expand result (even when
+    // false), and a $expand response is a rendering of the value set, so its descriptive metadata carries over.
+    response.setExperimental(inlineVs.getExperimental());
+    // Echo the value set's own resource `language` (when declared) onto the expansion result — the tx-ecosystem
+    // expects the rendered ValueSet to carry the source VS language (distinct from the displayLanguage used to
+    // pick member displays). Only the VS's declared language, not a request/extension displayLanguage.
+    if (StringUtils.isNotEmpty(inlineVs.getLanguage())) {
+      response.setLanguage(inlineVs.getLanguage());
+    }
+    // An $expand response is a rendered view, not the value-set definition — the expansion replaces the
+    // compose (the tx-ecosystem marks compose optional on the expand result and the reference server omits it;
+    // echoing the source compose, including its raw include version, mismatches). The stored path already
+    // drops it in ValueSetFhirMapper; mirror that here.
 
     // Build expansion
     com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansion expansion =
         new com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansion();
     expansion.setTimestamp(java.time.OffsetDateTime.now());
+    // FHIR requires expansion.identifier (a globally-unique handle for this expansion); the tx-ecosystem
+    // matches it as any uuid ($uuid$). Without it the expand tests fail "missing property identifier".
+    expansion.setIdentifier("urn:uuid:" + java.util.UUID.randomUUID());
     expansion.setTotal(totalAfterFilter);
     if (offset != null) {
       expansion.setOffset(offset);
     }
+    // expansion.parameter: the echoed control params (excludeNested, activeOnly, …) plus the derived
+    // used-codesystem entries — same shape as the stored-snapshot path (reuses the mapper helper).
+    List<com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionParameter> expansionParameters =
+        ValueSetFhirMapper.expansionParameters(req, expandedConcepts);
+    // used-codesystem is normally derived from the expanded members. When a filter excludes every member the
+    // expansion is empty, but the code system(s) the value set drew from were still "used" — so derive
+    // used-codesystem from the resolved compose includes instead (the reference engine reports it on an empty
+    // search result). Only when none was derived from members, so a non-empty expansion is unaffected.
+    if (expansionParameters.stream().noneMatch(pp -> "used-codesystem".equals(pp.getName()))
+        && inlineVs.getCompose() != null && inlineVs.getCompose().getInclude() != null) {
+      java.util.LinkedHashSet<String> includeSystems = new java.util.LinkedHashSet<>();
+      for (var inc : inlineVs.getCompose().getInclude()) {
+        if (inc.getSystem() != null) {
+          includeSystems.add(inc.getSystem() + (inc.getVersion() != null ? "|" + inc.getVersion() : ""));
+        }
+      }
+      includeSystems.forEach(s -> expansionParameters.add(
+          new com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionParameter().setName("used-codesystem").setValueUri(s)));
+    }
+    // The reference engine reports used-codesystem as `system|version` whenever the code system has a
+    // version. The inline expand SQL does not carry the resolved CS version onto its members, and the
+    // empty-expansion compose fallback above only knows the version the include pinned (often none), so
+    // both can emit a bare `system`. Backfill the version from the request's tx-resource CodeSystems:
+    // a versionless code system (no version on its tx-resource) stays bare, and a system that resolves
+    // to more than one distinct version is left untouched (ambiguous).
+    java.util.Map<String, java.util.Set<String>> txResourceVersions = new java.util.HashMap<>();
+    if (req != null && req.getParameter() != null) {
+      for (ParametersParameter p : req.getParameter()) {
+        if ("tx-resource".equals(p.getName()) && p.getResource() instanceof com.kodality.zmei.fhir.resource.terminology.CodeSystem cs
+            && cs.getUrl() != null && StringUtils.isNotEmpty(cs.getVersion())) {
+          txResourceVersions.computeIfAbsent(cs.getUrl(), k -> new java.util.HashSet<>()).add(cs.getVersion());
+        }
+      }
+    }
+    expansionParameters.stream()
+        .filter(pp -> "used-codesystem".equals(pp.getName()) && pp.getValueUri() != null && !pp.getValueUri().contains("|"))
+        .forEach(pp -> {
+          java.util.Set<String> versions = txResourceVersions.get(pp.getValueUri());
+          if (versions != null && versions.size() == 1) {
+            pp.setValueUri(pp.getValueUri() + "|" + versions.iterator().next());
+          }
+        });
+    // Derived used-supplement params (resolved url|version) for supplements applied to this inline expansion.
+    usedSupplements.forEach(s -> expansionParameters.add(new com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionParameter()
+        .setName("used-supplement").setValueUri(s.asCanonical())));
+    // Derived used-valueset params for each imported value set (compose.include.valueSet) resolved in this expansion.
+    usedValueSets.stream().distinct().forEach(vsRef -> expansionParameters.add(
+        new com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionParameter().setName("used-valueset").setValueUri(vsRef)));
+    // The display language the server resolved from the value set's own declaration (expansion-parameter
+    // extension, else VS resource `language`) or — failing that — the request's Accept-Language header is echoed
+    // as a displayLanguage expansion.parameter, unless the request already carried a displayLanguage param.
+    String vsExpDisplayLanguage = vsDeclaredDisplayLanguage(inlineVs);
+    String echoDisplayLanguage = StringUtils.isNotEmpty(vsExpDisplayLanguage) ? vsExpDisplayLanguage : acceptLanguageHeader();
+    if (StringUtils.isNotEmpty(echoDisplayLanguage)
+        && expansionParameters.stream().noneMatch(pp -> "displayLanguage".equals(pp.getName()))) {
+      expansionParameters.add(new com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionParameter()
+          .setName("displayLanguage").setValueCode(echoDisplayLanguage));
+    }
+    // A used-codesystem must reflect the source: when the tx-resource CodeSystem declares no version, the
+    // import-defaulted version (e.g. 1.0.0) must be dropped so used-codesystem is the bare system uri.
+    java.util.Set<String> versionlessSystems = versionlessTxCodeSystems(req);
+    if (!versionlessSystems.isEmpty()) {
+      for (var pp : expansionParameters) {
+        if ("used-codesystem".equals(pp.getName()) && pp.getValueUri() != null) {
+          int pipe = pp.getValueUri().indexOf('|');
+          if (pipe > 0 && versionlessSystems.contains(pp.getValueUri().substring(0, pipe))) {
+            pp.setValueUri(pp.getValueUri().substring(0, pipe));
+          }
+        }
+      }
+    }
+    // Status warnings: each used code system / the value set that is experimental, draft, deprecated or
+    // withdrawn contributes a warning-<status> expansion parameter (the reference engine flags non-active
+    // sources). The status comes from the tx-resource `experimental`/`status`/standards-status extension.
+    for (var pp : new java.util.ArrayList<>(expansionParameters)) {
+      if ("used-codesystem".equals(pp.getName()) && pp.getValueUri() != null) {
+        String sys = pp.getValueUri().indexOf('|') > 0 ? pp.getValueUri().substring(0, pp.getValueUri().indexOf('|')) : pp.getValueUri();
+        com.kodality.zmei.fhir.resource.terminology.CodeSystem usedCs = txCodeSystem(req, sys);
+        String w = statusWarning(usedCs);
+        if (w != null) {
+          expansionParameters.add(new com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionParameter().setName(w).setValueUri(pp.getValueUri()));
+        }
+        // A code system whose content is a fragment (only a subset of its codes) is additionally reported via a
+        // used-fragment parameter, and the expansion is marked UNCLOSED (it could not be guaranteed complete).
+        if (usedCs != null && "fragment".equals(usedCs.getContent())) {
+          expansionParameters.add(new com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionParameter()
+              .setName("used-fragment").setValueUri(pp.getValueUri()));
+          if (expansion.getExtensions("http://hl7.org/fhir/StructureDefinition/valueset-unclosed").findAny().isEmpty()) {
+            expansion.addExtension(new com.kodality.zmei.fhir.Extension("http://hl7.org/fhir/StructureDefinition/valueset-unclosed").setValueBoolean(true));
+            expansion.addExtension(new com.kodality.zmei.fhir.Extension("http://hl7.org/fhir/StructureDefinition/valueset-unclosed-reason")
+                .setValueString("This extension is based on a fragment of the code system " + sys));
+          }
+        }
+      }
+    }
+    String vsWarning = statusWarning(inlineVs);
+    if (vsWarning != null) {
+      expansionParameters.add(new com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionParameter().setName(vsWarning)
+          .setValueUri(inlineVs.getUrl() + (inlineVs.getVersion() != null ? "|" + inlineVs.getVersion() : "")));
+    }
+    // A non-active IMPORTED value set (compose.include.valueSet) contributes its own status warning too, the same
+    // way a used code system does — e.g. a withdrawn imported value set yields warning-withdrawn for its canonical.
+    for (var pp : new java.util.ArrayList<>(expansionParameters)) {
+      if ("used-valueset".equals(pp.getName()) && pp.getValueUri() != null) {
+        int pipe = pp.getValueUri().indexOf('|');
+        String vsUrl = pipe > 0 ? pp.getValueUri().substring(0, pipe) : pp.getValueUri();
+        String vsVer = pipe > 0 ? pp.getValueUri().substring(pipe + 1) : null;
+        com.kodality.zmei.fhir.resource.terminology.ValueSet usedVs = txResourceValueSets(req, vsUrl).stream()
+            .filter(v -> vsVer == null || vsVer.equals(v.getVersion())).findFirst().orElse(null);
+        String w = statusWarning(usedVs);
+        if (w != null) {
+          expansionParameters.add(new com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionParameter().setName(w).setValueUri(pp.getValueUri()));
+        }
+      }
+    }
+    // For a multi-version system, used-codesystem reports EVERY version the compose referenced (include OR
+    // exclude) — an exclude consumes its version even when no member from it survives — listed in version order.
+    for (String sys : multiVersionSystems) {
+      java.util.TreeSet<String> versions = new java.util.TreeSet<>(ValueSetExpandOperation::compareVersions);
+      java.util.stream.Stream.concat(
+              java.util.Optional.ofNullable(inlineVs.getCompose().getInclude()).orElse(List.of()).stream(),
+              java.util.Optional.ofNullable(inlineVs.getCompose().getExclude()).orElse(List.of()).stream())
+          .filter(inc -> sys.equals(inc.getSystem()) && StringUtils.isNotEmpty(inc.getVersion()))
+          .forEach(inc -> versions.add(inc.getVersion()));
+      if (versions.isEmpty()) {
+        continue;
+      }
+      expansionParameters.removeIf(pp -> "used-codesystem".equals(pp.getName())
+          && pp.getValueUri() != null && pp.getValueUri().startsWith(sys + "|"));
+      versions.forEach(v -> expansionParameters.add(new com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionParameter()
+          .setName("used-codesystem").setValueUri(sys + "|" + v)));
+    }
+    if (versionsMatchApplied) {
+      expansionParameters.add(new com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionParameter()
+          .setName("versionsMatch").setValueBoolean(true));
+    }
+    expansion.setParameter(expansionParameters.isEmpty() ? null : expansionParameters);
+    // Declare the requested properties so contains[].property references a declared expansion.property (valid FHIR).
+    // Each declared property carries its uri — from the tx-resource CodeSystem's property definition, falling back
+    // to the FHIR concept-properties uri for the built-in codes (definition/status/…).
+    if (!requestedProperties.isEmpty()) {
+      java.util.Map<String, String> propertyUris = propertyUris(req);
+      expansion.setProperty(requestedProperties.stream()
+          .map(code -> new com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionProperty().setCode(code)
+              .setUri(propertyUris.getOrDefault(code, "http://hl7.org/fhir/concept-properties#" + code)))
+          .toList());
+    }
+
+    // Designation use codings as stated by the tx-resource CodeSystem(s), keyed by use code — so a custom
+    // designation surfaces its real use system (e.g. {.../designations, olde-english}) on contains[].designation.
+    java.util.Map<String, com.kodality.zmei.fhir.datatypes.Coding> designationUses = designationUses(req);
+    java.util.Set<String> noLanguageDesignations = noLanguageDesignations(req);
+    java.util.Set<String> noUseDesignations = noUseDesignations(req);
+
+    // P1 display-language: pick each member's display by the effective language (requested displayLanguage →
+    // VS expansion-parameter extension → the CodeSystem's resource language) and drop the chosen value from
+    // the member's alternate designations, so contains[].display is the resource/requested-language one and
+    // the other-language designations are kept (below).
+    String vsDisplayLanguage = vsDeclaredDisplayLanguage(inlineVs);
+    String acceptLanguage = acceptLanguageHeader();
+    applyDisplayLanguage(expandedConcepts, displayLanguage, vsDisplayLanguage, acceptLanguage, resourceLanguages(req), primaryDisplays(req));
+
+    // FHIR adds `version` to a contains member only when the expansion spans more than one code system
+    // version (a mixed/multi-version value set), to disambiguate; a single-version expansion omits it.
+    boolean emitContainsVersion = !multiVersionSystems.isEmpty() || expandedConcepts.stream()
+        .map(c -> c.getConcept() != null && c.getConcept().getCodeSystemVersions() != null
+            ? c.getConcept().getCodeSystemVersions().stream().findFirst().orElse(null) : null)
+        .filter(java.util.Objects::nonNull).distinct().count() > 1;
+
+    // VS-scoped concept deprecation: the value set's compose can mark an enumerated concept as deprecated via a
+    // valueset-deprecated / standards-status extension on the include.concept (the concept itself may be active in
+    // its code system — this is a value-set-level annotation). The expand SQL drops compose-level extensions, so
+    // rebuild a (system|code → extensions) map from the source compose and echo those extensions onto the matching
+    // expansion.contains entry.
+    java.util.Map<String, List<com.kodality.zmei.fhir.Extension>> composeConceptDeprecation = new java.util.HashMap<>();
+    if (inlineVs.getCompose() != null && inlineVs.getCompose().getInclude() != null) {
+      for (var inc : inlineVs.getCompose().getInclude()) {
+        if (inc.getConcept() == null) {
+          continue;
+        }
+        for (var cc : inc.getConcept()) {
+          if (cc.getCode() == null || cc.getExtension() == null) {
+            continue;
+          }
+          List<com.kodality.zmei.fhir.Extension> deps = cc.getExtension().stream()
+              .filter(e -> VALUESET_DEPRECATED_URL.equals(e.getUrl()) || STANDARDS_STATUS_URL.equals(e.getUrl()))
+              .toList();
+          if (!deps.isEmpty()) {
+            composeConceptDeprecation.put((inc.getSystem() != null ? inc.getSystem() : "") + "|" + cc.getCode(), deps);
+          }
+        }
+      }
+    }
 
     // Map concepts to expansion contains
-    List<com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionContains> contains = 
+    List<com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionContains> contains =
         expandedConcepts.stream().map(concept -> {
-          com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionContains contain = 
+          com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionContains contain =
               new com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionContains();
           contain.setSystem(concept.getConcept().getCodeSystemUri());
           contain.setCode(concept.getConcept().getCode());
           if (concept.getDisplay() != null) {
             contain.setDisplay(concept.getDisplay().getName());
           }
+          if (emitContainsVersion && concept.getConcept().getCodeSystemVersions() != null) {
+            concept.getConcept().getCodeSystemVersions().stream().findFirst().ifPresent(contain::setVersion);
+          }
+          // FHIR expansion.contains flags, both omitted when false: `inactive` for a retired/deprecated
+          // concept, `abstract` for a not-selectable (grouper) concept. The SQL expand returns members bare,
+          // so these come from decorateExpansionFlags (a bulk load of the windowed members' versions).
+          if (isInactiveMember(concept)
+              || (concept.getConcept() != null && txInactiveCodes.contains(concept.getConcept().getCodeSystemUri() + "|" + concept.getConcept().getCode()))) {
+            contain.setInactive(true);
+          }
+          if (isAbstractMember(concept)
+              || (concept.getConcept() != null && txAbstractCodes.contains(concept.getConcept().getCodeSystemUri() + "|" + concept.getConcept().getCode()))) {
+            contain.setAbstractField(true);
+          }
+          // Echo any VS-scoped deprecation extensions the source compose stated for this member.
+          List<com.kodality.zmei.fhir.Extension> depExts = composeConceptDeprecation.get(contain.getSystem() + "|" + contain.getCode());
+          if (depExts != null) {
+            depExts.forEach(contain::addExtension);
+          }
           if (includeDesignations && concept.getAdditionalDesignations() != null) {
-            contain.setDesignation(concept.getAdditionalDesignations().stream()
+            List<com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetComposeIncludeConceptDesignation> designations =
+                concept.getAdditionalDesignations().stream()
+                .filter(d -> ValueSetFhirMapper.designationMatchesFilter(d, designationFilter))
+                // The designation repeating the member's display is already removed (applyDisplayLanguage drops it
+                // by value); the definition is surfaced as a definition property, never a designation, so it is
+                // dropped from the designation array even when a `designation` language filter would otherwise
+                // match it (a definition is not a linguistic designation).
+                .filter(d -> !"definition".equals(d.getDesignationType()))
                 .map(d -> {
-                  com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetComposeIncludeConceptDesignation designation = 
+                  com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetComposeIncludeConceptDesignation designation =
                       new com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetComposeIncludeConceptDesignation();
-                  designation.setLanguage(d.getLanguage());
                   designation.setValue(d.getName());
+                  // Round-trip any raw FHIR designation.extension (e.g. coding-sctdescid) preserved at import.
+                  List<com.kodality.zmei.fhir.Extension> desExt =
+                      org.termx.terminology.fhir.codesystem.CodeSystemFhirMapper.toFhirDesignationExtensions(d.getExtension());
+                  if (desExt != null) {
+                    designation.setExtension(desExt);
+                  }
+                  // Emit the designation's `language`, EXCEPT where the tx-resource CodeSystem shows this
+                  // designation has no stated language (import defaults a missing language to the resource
+                  // language, but the tx-ecosystem omits it). For a stored code system the set is empty, so the
+                  // stored language is preserved.
+                  if (!noLanguageDesignations.contains(d.getName())) {
+                    designation.setLanguage(d.getLanguage());
+                  }
+                  // A designation the source stated WITHOUT a use is echoed without one (the import defaults a
+                  // missing use to type "display", which must not resurface as a use coding). Otherwise prefer the
+                  // designation's own use coding from the tx-resource CodeSystem (it carries the use system for
+                  // custom designations, e.g. {.../designations, olde-english}); fall back to the type→use mapping.
+                  if (PREFERRED_FOR_LANGUAGE_TYPE.equals(d.getDesignationType())) {
+                    // The primary display displaced by displayLanguage — tag it regardless of noUseDesignations
+                    // (it was stated without a use, but as a displaced display it carries the preferredForLanguage use).
+                    designation.setUse(new com.kodality.zmei.fhir.datatypes.Coding(
+                        "http://terminology.hl7.org/CodeSystem/hl7TermMaintInfra", "preferredForLanguage")
+                        .setDisplay("Preferred For Language"));
+                  } else if (!noUseDesignations.contains(d.getName())) {
+                    com.kodality.zmei.fhir.datatypes.Coding use = designationUses.get(d.getDesignationType());
+                    designation.setUse(use != null ? use
+                        : org.termx.terminology.fhir.codesystem.CodeSystemFhirMapper.designationUseCoding(
+                            d.getDesignationType() == null ? "display" : d.getDesignationType()));
+                  }
                   return designation;
-                }).toList());
+                }).toList();
+            if (!designations.isEmpty()) {
+              contain.setDesignation(designations);
+            }
+          }
+          if (!requestedProperties.isEmpty()) {
+            List<com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionContainsProperty> props =
+                new java.util.ArrayList<>(
+                    ValueSetFhirMapper.toFhirContainsProperties(concept.getPropertyValues(), requestedProperties::contains, displayLanguage));
+            // `definition` is stored as an implicit designation (type "definition"), not an EntityPropertyValue, so
+            // toFhirContainsProperties cannot see it. When the request asks for the `definition` property, surface it
+            // from that designation as a definition property (mirroring how the CodeSystem mapper special-cases the
+            // status concept field). The definition designation is already excluded from the designation array above.
+            if (requestedProperties.contains("definition")
+                && props.stream().noneMatch(p -> "definition".equals(p.getCode()))
+                && concept.getAdditionalDesignations() != null) {
+              concept.getAdditionalDesignations().stream()
+                  .filter(d -> "definition".equals(d.getDesignationType()) && StringUtils.isNotEmpty(d.getName()))
+                  .map(d -> d.getName())
+                  .findFirst()
+                  .ifPresent(def -> props.add(
+                      new com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionContainsProperty()
+                          .setCode("definition").setValueString(def)));
+            }
+            if (!props.isEmpty()) {
+              contain.setProperty(props);
+            }
+          }
+          // The reference always surfaces a `status` property for a non-active (retired/deprecated) member, even
+          // when no `property` was requested. Add it (deduped) so a retired member carries its status.
+          String memberStatus = concept.getStatus();
+          if (memberStatus != null && List.of("retired", "deprecated").contains(memberStatus)) {
+            List<com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionContainsProperty> sprops =
+                contain.getProperty() != null
+                    ? new java.util.ArrayList<>(contain.getProperty())
+                    : new java.util.ArrayList<>();
+            if (sprops.stream().noneMatch(p -> "status".equals(p.getCode()))) {
+              sprops.add(new com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionContainsProperty()
+                  .setCode("status").setValueCode(memberStatus));
+              contain.setProperty(sprops);
+            }
           }
           return contain;
         }).toList();
+    // Declare the `status` property in expansion.property when any member carries it (it is auto-emitted above
+    // for non-active members even if `status` wasn't a requested property).
+    boolean statusEmitted = contains.stream().anyMatch(c -> c.getProperty() != null
+        && c.getProperty().stream().anyMatch(p -> "status".equals(p.getCode())));
+    if (statusEmitted) {
+      List<com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionProperty> declared =
+          expansion.getProperty() != null ? new java.util.ArrayList<>(expansion.getProperty()) : new java.util.ArrayList<>();
+      if (declared.stream().noneMatch(p -> "status".equals(p.getCode()))) {
+        declared.add(new com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionProperty()
+            .setCode("status").setUri("http://hl7.org/fhir/concept-properties#status"));
+        expansion.setProperty(declared);
+      }
+    }
+
+    // FHIR hierarchical expansion: when excludeNested is explicitly false, nest each member under its parent
+    // (ValueSet.expansion.contains.contains) instead of returning a flat list. Membership/total stay flat; this
+    // only reshapes the presentation. The parent of each code comes from the tx-resource CodeSystem's nested
+    // concept tree. When excludeNested is absent or true, the flat list is kept (the default and prior behaviour).
+    // An enumerated value set (explicit compose.include.concept list) is a flat selection, not a view of the
+    // code system hierarchy — it is never nested, even with excludeNested=false.
+    boolean enumerated = !expandedConcepts.isEmpty() && expandedConcepts.stream().allMatch(ValueSetVersionConcept::isEnumerated);
+    // Multi-version "overload": when a code system is included at more than one version, the reference engine
+    // orders the expansion by code ascending then version descending (code1@2.0.0, code1@1.0.0, code2@2.0.0, …),
+    // not by include order. Scope this narrowly — only a NON-enumerated expansion that actually spans more than
+    // one version — so an enumerated value set keeps its definition order and a single-version expansion (the
+    // overwhelming majority) is untouched.
+    long distinctVersions = contains.stream()
+        .map(com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionContains::getVersion)
+        .filter(java.util.Objects::nonNull).distinct().count();
+    if (!enumerated && distinctVersions > 1) {
+      // The set of system|version the compose pins EXPLICITLY. A member at an explicit version sorts (within a
+      // code) version-descending; a member that only exists via an UNVERSIONED include (the system's latest) sorts
+      // AFTER the explicit ones. So overload-all ([1.0.0,2.0.0] both explicit) → 2.0.0,1.0.0; overload-mixed
+      // ([1.0.0, unversioned]) → 1.0.0 (explicit) then 2.0.0 (latest).
+      java.util.Set<String> explicitSysVer = new java.util.HashSet<>();
+      if (inlineVs.getCompose() != null && inlineVs.getCompose().getInclude() != null) {
+        for (var inc : inlineVs.getCompose().getInclude()) {
+          if (inc.getSystem() != null && StringUtils.isNotEmpty(inc.getVersion())) {
+            explicitSysVer.add(inc.getSystem() + "|" + inc.getVersion());
+          }
+        }
+      }
+      java.util.function.Predicate<com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionContains> isExplicit =
+          c -> c.getSystem() != null && c.getVersion() != null && explicitSysVer.contains(c.getSystem() + "|" + c.getVersion());
+      List<com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionContains> ordered = new java.util.ArrayList<>(contains);
+      ordered.sort((a, b) -> {
+        int byCode = java.util.Comparator.nullsLast(String::compareTo).compare(a.getCode(), b.getCode());
+        if (byCode != 0) {
+          return byCode;
+        }
+        boolean ae = isExplicit.test(a);
+        boolean be = isExplicit.test(b);
+        if (ae != be) {
+          return ae ? -1 : 1; // explicit-version members precede latest-from-unversioned members
+        }
+        if (a.getVersion() == null || b.getVersion() == null) {
+          return java.util.Comparator.nullsLast(String::compareTo).compare(b.getVersion(), a.getVersion());
+        }
+        return compareVersions(b.getVersion(), a.getVersion()); // version descending within the same group
+      });
+      contains = ordered;
+    }
+    boolean nestHierarchy = !enumerated && req != null && req.findParameter("excludeNested").isPresent()
+        && req.findParameter("excludeNested")
+            .map(p -> !(Boolean.TRUE.equals(p.getValueBoolean()) || "true".equals(p.getValueString()))).orElse(false);
+    if (nestHierarchy) {
+      contains = nestContains(contains, hierarchyParents(req));
+    }
     expansion.setContains(contains);
 
     response.setExpansion(expansion);
     return response;
+  }
+
+  /** CodeSystem property code→uri from the tx-resource CodeSystems' property definitions. */
+  private static java.util.Map<String, String> propertyUris(Parameters req) {
+    java.util.Map<String, String> uris = new java.util.HashMap<>();
+    if (req == null || req.getParameter() == null) {
+      return uris;
+    }
+    for (ParametersParameter p : req.getParameter()) {
+      if ("tx-resource".equals(p.getName()) && p.getResource() instanceof com.kodality.zmei.fhir.resource.terminology.CodeSystem cs
+          && cs.getProperty() != null) {
+        for (var prop : cs.getProperty()) {
+          if (prop.getCode() != null && prop.getUri() != null) {
+            uris.putIfAbsent(prop.getCode(), prop.getUri());
+          }
+        }
+      }
+    }
+    return uris;
+  }
+
+  /** Designation use codings stated by the tx-resource CodeSystems, keyed by the use code (so custom designations keep their use system). */
+  private static java.util.Map<String, com.kodality.zmei.fhir.datatypes.Coding> designationUses(Parameters req) {
+    java.util.Map<String, com.kodality.zmei.fhir.datatypes.Coding> uses = new java.util.HashMap<>();
+    if (req == null || req.getParameter() == null) {
+      return uses;
+    }
+    for (ParametersParameter p : req.getParameter()) {
+      if ("tx-resource".equals(p.getName()) && p.getResource() instanceof com.kodality.zmei.fhir.resource.terminology.CodeSystem cs) {
+        collectDesignationUses(cs.getConcept(), uses);
+      }
+    }
+    return uses;
+  }
+
+  private static void collectDesignationUses(List<com.kodality.zmei.fhir.resource.terminology.CodeSystem.CodeSystemConcept> concepts,
+                                             java.util.Map<String, com.kodality.zmei.fhir.datatypes.Coding> uses) {
+    if (concepts == null) {
+      return;
+    }
+    for (var c : concepts) {
+      if (c.getDesignation() != null) {
+        for (var d : c.getDesignation()) {
+          if (d.getUse() != null && d.getUse().getCode() != null) {
+            uses.putIfAbsent(d.getUse().getCode(), d.getUse());
+          }
+        }
+      }
+      collectDesignationUses(c.getConcept(), uses);
+    }
+  }
+
+  /** Designation values that the tx-resource CodeSystems state WITHOUT a language (so the import-defaulted language is dropped on echo). */
+  private static java.util.Set<String> noLanguageDesignations(Parameters req) {
+    java.util.Set<String> values = new java.util.HashSet<>();
+    if (req == null || req.getParameter() == null) {
+      return values;
+    }
+    for (ParametersParameter p : req.getParameter()) {
+      if ("tx-resource".equals(p.getName()) && p.getResource() instanceof com.kodality.zmei.fhir.resource.terminology.CodeSystem cs) {
+        collectNoLanguageDesignations(cs.getConcept(), values);
+      }
+    }
+    return values;
+  }
+
+  private static void collectNoLanguageDesignations(List<com.kodality.zmei.fhir.resource.terminology.CodeSystem.CodeSystemConcept> concepts,
+                                                    java.util.Set<String> values) {
+    if (concepts == null) {
+      return;
+    }
+    for (var c : concepts) {
+      if (c.getDesignation() != null) {
+        for (var d : c.getDesignation()) {
+          if (d.getValue() != null && d.getLanguage() == null) {
+            values.add(d.getValue());
+          }
+        }
+      }
+      collectNoLanguageDesignations(c.getConcept(), values);
+    }
+  }
+
+  /** {@code CodeSystem.url → resource language} from the tx-resource CodeSystems — used as the default
+   *  displayLanguage when the request states none (a member's display is then its resource-language one). */
+  private static java.util.Map<String, String> resourceLanguages(Parameters req) {
+    java.util.Map<String, String> langs = new java.util.HashMap<>();
+    if (req == null || req.getParameter() == null) {
+      return langs;
+    }
+    for (ParametersParameter p : req.getParameter()) {
+      if ("tx-resource".equals(p.getName()) && p.getResource() instanceof com.kodality.zmei.fhir.resource.terminology.CodeSystem cs
+          && StringUtils.isNotEmpty(cs.getUrl()) && StringUtils.isNotEmpty(cs.getLanguage())) {
+        langs.putIfAbsent(cs.getUrl(), cs.getLanguage());
+      }
+    }
+    return langs;
+  }
+
+  /** {@code system|code → CodeSystem.concept.display} (the PRIMARY display) from the tx-resource CodeSystems —
+   *  so the display re-pick prefers the concept's own primary display over an alternate same-language designation. */
+  private static java.util.Map<String, String> primaryDisplays(Parameters req) {
+    java.util.Map<String, String> displays = new java.util.HashMap<>();
+    if (req == null || req.getParameter() == null) {
+      return displays;
+    }
+    for (ParametersParameter p : req.getParameter()) {
+      if ("tx-resource".equals(p.getName()) && p.getResource() instanceof com.kodality.zmei.fhir.resource.terminology.CodeSystem cs
+          && StringUtils.isNotEmpty(cs.getUrl())) {
+        collectPrimaryDisplays(cs.getUrl(), cs.getConcept(), displays);
+      }
+    }
+    return displays;
+  }
+
+  private static void collectPrimaryDisplays(String system, List<com.kodality.zmei.fhir.resource.terminology.CodeSystem.CodeSystemConcept> concepts,
+                                             java.util.Map<String, String> displays) {
+    if (concepts == null) {
+      return;
+    }
+    for (var c : concepts) {
+      if (c.getCode() != null && StringUtils.isNotEmpty(c.getDisplay())) {
+        displays.putIfAbsent(system + "|" + c.getCode(), c.getDisplay());
+      }
+      collectPrimaryDisplays(system, c.getConcept(), displays);
+    }
+  }
+
+  /** The primary language tag of the request's {@code Accept-Language} header (e.g. {@code en} from
+   *  {@code en-US,en;q=0.9}), or null. The LOWEST-priority display-language source — below an explicit
+   *  {@code displayLanguage} param and the value set's own declared language. */
+  private static String acceptLanguageHeader() {
+    return io.micronaut.http.context.ServerRequestContext.currentRequest()
+        .map(r -> r.getHeaders().get("Accept-Language"))
+        .filter(StringUtils::isNotEmpty)
+        .map(h -> h.split(",")[0].split(";")[0].trim())
+        .filter(StringUtils::isNotEmpty)
+        .orElse(null);
+  }
+
+  /** The display language a value set itself declares — its {@code compose.extension[valueset-expansion-parameter]}
+   *  {@code displayLanguage}, else the VS resource {@code language}. Applied AND echoed as an expansion.parameter.
+   *  (Ranks below an explicit request {@code displayLanguage}; an Accept-Language header would rank below this.) */
+  private static String vsDeclaredDisplayLanguage(com.kodality.zmei.fhir.resource.terminology.ValueSet vs) {
+    String ext = vsExpansionDisplayLanguage(vs);
+    return StringUtils.isNotEmpty(ext) ? ext : (vs != null ? vs.getLanguage() : null);
+  }
+
+  /** The {@code displayLanguage} declared by a value set's {@code compose.extension[valueset-expansion-parameter]}
+   *  (a VS-embedded expansion control) — applied AND echoed as an {@code expansion.parameter}. */
+  private static String vsExpansionDisplayLanguage(com.kodality.zmei.fhir.resource.terminology.ValueSet vs) {
+    if (vs == null || vs.getCompose() == null || vs.getCompose().getExtension() == null) {
+      return null;
+    }
+    for (com.kodality.zmei.fhir.Extension ext : vs.getCompose().getExtension()) {
+      if (!"http://hl7.org/fhir/StructureDefinition/valueset-expansion-parameter".equals(ext.getUrl()) || ext.getExtension() == null) {
+        continue;
+      }
+      String name = ext.getExtension().stream().filter(e -> "name".equals(e.getUrl()))
+          .map(e -> e.getValueString() != null ? e.getValueString() : e.getValueCode()).filter(java.util.Objects::nonNull).findFirst().orElse(null);
+      if ("displayLanguage".equals(name)) {
+        return ext.getExtension().stream().filter(e -> "value".equals(e.getUrl()))
+            .map(e -> e.getValueCode() != null ? e.getValueCode() : e.getValueString()).filter(java.util.Objects::nonNull).findFirst().orElse(null);
+      }
+    }
+    return null;
+  }
+
+  /** Designation VALUES the tx-resource CodeSystem stated with NO {@code use} — kept on contains[].designation
+   *  without a `use` coding (the import defaults a missing use to type "display", which must not resurface). */
+  private static java.util.Set<String> noUseDesignations(Parameters req) {
+    java.util.Set<String> values = new java.util.HashSet<>();
+    if (req == null || req.getParameter() == null) {
+      return values;
+    }
+    for (ParametersParameter p : req.getParameter()) {
+      if ("tx-resource".equals(p.getName()) && p.getResource() instanceof com.kodality.zmei.fhir.resource.terminology.CodeSystem cs) {
+        collectNoUseDesignations(cs.getConcept(), values);
+      }
+    }
+    return values;
+  }
+
+  private static void collectNoUseDesignations(List<com.kodality.zmei.fhir.resource.terminology.CodeSystem.CodeSystemConcept> concepts,
+                                               java.util.Set<String> values) {
+    if (concepts == null) {
+      return;
+    }
+    for (var c : concepts) {
+      if (c.getDesignation() != null) {
+        for (var d : c.getDesignation()) {
+          if (d.getValue() != null && (d.getUse() == null || d.getUse().getCode() == null)) {
+            values.add(d.getValue());
+          }
+        }
+      }
+      collectNoUseDesignations(c.getConcept(), values);
+    }
+  }
+
+  /**
+   * P1 display-language: choose each member's display by the effective language — the requested
+   * {@code displayLanguage}, else the VS expansion-parameter extension, else the member's CodeSystem resource
+   * language — re-picking from the member's own designations (display + additional). When the effective
+   * language is unknown (no language in play and no tx-resource resource language), the display is left as
+   * the SQL/provider chose it. The chosen display is then dropped from the member's additional designations
+   * (by value) so it is not also echoed as a designation.
+   */
+  /** Sentinel designation type marking a primary display displaced by displayLanguage; emitted as a preferredForLanguage use. */
+  private static final String PREFERRED_FOR_LANGUAGE_TYPE = "__preferredForLanguage__";
+
+  /** One entry of a parsed displayLanguage / Accept-Language range list: a tag (or `*` wildcard) and its q-weight. */
+  private record LangRange(String tag, boolean wildcard, double weight) {}
+
+  /** Parse a BCP-47 language-range list ("de, en;q=0.8, *;q=0") into ordered {@link LangRange} entries (default q=1). */
+  private static List<LangRange> parseLanguageRanges(String value) {
+    if (StringUtils.isEmpty(value)) {
+      return List.of();
+    }
+    List<LangRange> ranges = new java.util.ArrayList<>();
+    for (String part : value.split(",")) {
+      String[] params = part.trim().split(";");
+      String tag = params[0].trim();
+      if (tag.isEmpty()) {
+        continue;
+      }
+      double weight = 1.0;
+      for (int i = 1; i < params.length; i++) {
+        String pr = params[i].trim();
+        if (pr.startsWith("q=")) {
+          try {
+            weight = Double.parseDouble(pr.substring(2).trim());
+          } catch (NumberFormatException ignore) {
+            // malformed q-value: keep the default weight
+          }
+        }
+      }
+      ranges.add(new LangRange(tag, "*".equals(tag), weight));
+    }
+    return ranges;
+  }
+
+  private static void applyDisplayLanguage(List<ValueSetVersionConcept> concepts, String requestedLanguage,
+                                           String vsDisplayLanguage, String acceptLanguage, java.util.Map<String, String> resourceLanguages,
+                                           java.util.Map<String, String> primaryDisplays) {
+    for (ValueSetVersionConcept c : concepts) {
+      // Only re-pick WHICH designation is the display; never invent a display for a member that has none
+      // (that would surface an "unexpected" display where the reference omits it).
+      if (c.getDisplay() == null) {
+        continue;
+      }
+      String system = c.getConcept() != null ? c.getConcept().getCodeSystemUri() : null;
+      String code = c.getConcept() != null ? c.getConcept().getCode() : null;
+      String resourceLanguage = system != null ? resourceLanguages.get(system) : null;
+      // Precedence: explicit displayLanguage param > VS-declared language > CodeSystem resource language >
+      // Accept-Language header (the header ranks BELOW the resource/VS language, per decision 2026-06-20).
+      String effective = StringUtils.isNotEmpty(requestedLanguage) ? requestedLanguage
+          : StringUtils.isNotEmpty(vsDisplayLanguage) ? vsDisplayLanguage
+          : StringUtils.isNotEmpty(resourceLanguage) ? resourceLanguage
+          : acceptLanguage;
+      // De-dupe display + additional designations by (language, value) — the SQL expand can carry the display
+      // value as an additional designation too, which would otherwise resurface as a duplicate designation.
+      java.util.LinkedHashMap<String, Designation> all = new java.util.LinkedHashMap<>();
+      all.putIfAbsent(c.getDisplay().getLanguage() + "|" + c.getDisplay().getName(), c.getDisplay());
+      if (c.getAdditionalDesignations() != null) {
+        c.getAdditionalDesignations().forEach(d -> all.putIfAbsent(d.getLanguage() + "|" + d.getName(), d));
+      }
+      String primaryDisplay = system != null && code != null ? primaryDisplays.get(system + "|" + code) : null;
+      final String eff = effective;
+      // displayLanguage is a BCP-47 language-range LIST ("de,*; q=0"), not a single tag: parse it into the
+      // positive-weight tags to match against and whether a `*; q=0` wildcard explicitly excludes any fallback.
+      final List<LangRange> ranges = parseLanguageRanges(eff);
+      final boolean strictNoFallback = ranges.stream().anyMatch(r -> r.wildcard && r.weight <= 0);
+      final List<String> positiveTags = ranges.stream().filter(r -> !r.wildcard && r.weight > 0).map(r -> r.tag).toList();
+      Designation chosen = c.getDisplay();
+      if (StringUtils.isNotEmpty(eff)) {
+        // Among candidates matching a positive-weight (non-wildcard) range, prefer an EXACT language match over a
+        // region-subtag match (`de` over `de-CH`), then the concept's PRIMARY display value. A `definition`-use
+        // designation is NOT a display name (FHIR), so it must never be chosen as the display.
+        Designation match = positiveTags.isEmpty() ? null : all.values().stream()
+            .filter(d -> !"definition".equals(d.getDesignationType()))
+            .filter(d -> positiveTags.stream().anyMatch(t -> languageMatches(d.getLanguage(), t)))
+            .max(java.util.Comparator.comparingInt(d ->
+                (positiveTags.stream().anyMatch(t -> t.equalsIgnoreCase(d.getLanguage())) ? 2 : 0)
+                    + (d.getName() != null && d.getName().equals(primaryDisplay) ? 1 : 0)))
+            .orElse(null);
+        if (match != null) {
+          chosen = match;
+        } else if (strictNoFallback) {
+          // `*; q=0`: no language matched and any fallback is explicitly refused — omit the display entirely.
+          chosen = null;
+        } else {
+          // Lenient fallback: keep the concept's PRIMARY (resource-language) display rather than whatever the
+          // expansion happened to select (which may be an unrelated alternate-language designation).
+          final String resLang = system != null ? resourceLanguages.get(system) : null;
+          chosen = primaryDisplay == null ? c.getDisplay() : all.values().stream()
+              .filter(d -> primaryDisplay.equals(d.getName()))
+              .filter(d -> resLang == null || resLang.equalsIgnoreCase(d.getLanguage()))
+              .findFirst().orElse(c.getDisplay());
+        }
+      }
+      final Designation display = chosen;
+      c.setDisplay(display);
+      c.setAdditionalDesignations(all.values().stream().filter(d -> d != display).toList());
+      // The concept's PRIMARY (resource-language) display, when it is NOT the chosen display — because another
+      // language was chosen, or the display was omitted (strict) — is kept as a designation tagged
+      // use=preferredForLanguage (hl7TermMaintInfra), per the tx-ecosystem convention. Matched by primary value AND
+      // resource language so a same-valued region variant (e.g. de-CH echoing the de display) stays bare.
+      if (StringUtils.isNotEmpty(eff) && primaryDisplay != null) {
+        final String resLang = system != null ? resourceLanguages.get(system) : null;
+        all.values().stream()
+            .filter(d -> d != display && primaryDisplay.equals(d.getName()))
+            .filter(d -> resLang == null || resLang.equalsIgnoreCase(d.getLanguage()))
+            .findFirst().ifPresent(d -> d.setDesignationType(PREFERRED_FOR_LANGUAGE_TYPE));
+      }
+    }
+  }
+
+  /** BCP-47-ish language match: exact or a region refinement (`de` matches `de-DE`). */
+  private static boolean languageMatches(String language, String target) {
+    return language != null && target != null
+        && (language.equals(target) || language.startsWith(target + "-") || target.startsWith(language + "-"));
+  }
+
+  /** code-system child→parent map ({@code system|code} → parent code) from the tx-resource CodeSystems' nested concept trees. */
+  private static java.util.Map<String, String> hierarchyParents(Parameters req) {
+    java.util.Map<String, String> parents = new java.util.HashMap<>();
+    if (req == null || req.getParameter() == null) {
+      return parents;
+    }
+    for (ParametersParameter p : req.getParameter()) {
+      if ("tx-resource".equals(p.getName()) && p.getResource() instanceof com.kodality.zmei.fhir.resource.terminology.CodeSystem cs) {
+        collectParents(cs.getConcept(), cs.getUrl(), null, parents);
+      }
+    }
+    return parents;
+  }
+
+  private static void collectParents(List<com.kodality.zmei.fhir.resource.terminology.CodeSystem.CodeSystemConcept> concepts,
+                                     String system, String parentCode, java.util.Map<String, String> parents) {
+    if (concepts == null) {
+      return;
+    }
+    for (var c : concepts) {
+      if (parentCode != null) {
+        parents.put(system + "|" + c.getCode(), parentCode);
+      }
+      collectParents(c.getConcept(), system, c.getCode(), parents);
+    }
+  }
+
+  /** Reshapes a flat (ordered) contains list into a tree: each member whose parent is also present nests under it; the rest are roots. */
+  private static List<com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionContains> nestContains(
+      List<com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionContains> flat, java.util.Map<String, String> parents) {
+    java.util.Map<String, com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionContains> byCode = new java.util.LinkedHashMap<>();
+    for (var c : flat) {
+      byCode.put(c.getSystem() + "|" + c.getCode(), c);
+    }
+    List<com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionContains> roots = new java.util.ArrayList<>();
+    for (var c : flat) {
+      String parentCode = parents.get(c.getSystem() + "|" + c.getCode());
+      var parent = parentCode == null ? null : byCode.get(c.getSystem() + "|" + parentCode);
+      if (parent != null) {
+        if (parent.getContains() == null) {
+          parent.setContains(new java.util.ArrayList<>());
+        }
+        parent.getContains().add(c);
+      } else {
+        roots.add(c);
+      }
+    }
+    return roots;
+  }
+
+  /**
+   * Decorates the (already paged) inline-expansion members with the version {@code status} and property
+   * values the FHIR {@code inactive}/{@code abstract} flags need, in a single bulk query keyed by the
+   * member's code system entity version id (which the SQL expand DOES populate). The inline SQL path returns
+   * members without these, so without this they'd all look active and selectable.
+   */
+  /** The values of a repeated request parameter (e.g. {@code property}, {@code designation}), code or string. */
+  private static List<String> designationOrPropertyRequested(Parameters req, String name) {
+    return req == null || req.getParameter() == null ? List.of() :
+        req.getParameter().stream().filter(p -> name.equals(p.getName()))
+            .map(p -> p.getValueCode() != null ? p.getValueCode() : p.getValueString())
+            .filter(StringUtils::isNotEmpty).toList();
+  }
+
+  /** Loads concept property values onto the (already expanded) members, by code system entity version id — the stored snapshot omits them. */
+  private void decoratePropertyValues(List<ValueSetVersionConcept> concepts) {
+    String ids = concepts.stream()
+        .map(c -> c.getConcept() != null ? c.getConcept().getConceptVersionId() : null)
+        .filter(java.util.Objects::nonNull).distinct().map(String::valueOf)
+        .collect(java.util.stream.Collectors.joining(","));
+    if (StringUtils.isEmpty(ids)) {
+      return;
+    }
+    org.termx.ts.codesystem.CodeSystemEntityVersionQueryParams params = new org.termx.ts.codesystem.CodeSystemEntityVersionQueryParams();
+    params.setIds(ids);
+    params.setLimit(-1);
+    java.util.Map<Long, CodeSystemEntityVersion> byId = codeSystemEntityVersionService.query(params).getData().stream()
+        .collect(java.util.stream.Collectors.toMap(CodeSystemEntityVersion::getId, v -> v, (a, b) -> a));
+    concepts.forEach(c -> {
+      Long vid = c.getConcept() != null ? c.getConcept().getConceptVersionId() : null;
+      CodeSystemEntityVersion v = vid != null ? byId.get(vid) : null;
+      if (v != null && (c.getPropertyValues() == null || c.getPropertyValues().isEmpty())) {
+        c.setPropertyValues(v.getPropertyValues());
+      }
+    });
+  }
+
+  private void decorateExpansionFlags(List<ValueSetVersionConcept> concepts) {
+    String ids = concepts.stream()
+        .map(c -> c.getConcept() != null ? c.getConcept().getConceptVersionId() : null)
+        .filter(java.util.Objects::nonNull).distinct().map(String::valueOf)
+        .collect(java.util.stream.Collectors.joining(","));
+    if (StringUtils.isEmpty(ids)) {
+      return;
+    }
+    org.termx.ts.codesystem.CodeSystemEntityVersionQueryParams params = new org.termx.ts.codesystem.CodeSystemEntityVersionQueryParams();
+    params.setIds(ids);
+    params.setLimit(-1);
+    java.util.Map<Long, CodeSystemEntityVersion> byId = codeSystemEntityVersionService.query(params).getData().stream()
+        .collect(java.util.stream.Collectors.toMap(CodeSystemEntityVersion::getId, v -> v, (a, b) -> a));
+    concepts.forEach(c -> {
+      Long vid = c.getConcept() != null ? c.getConcept().getConceptVersionId() : null;
+      CodeSystemEntityVersion v = vid != null ? byId.get(vid) : null;
+      if (v != null) {
+        c.setStatus(v.getStatus());
+        c.setPropertyValues(v.getPropertyValues());
+        // The SQL expand carries the code system version *id* but not its number; the loaded entity version
+        // knows the version(s) it belongs to, so surface them — `used-codesystem` reports `system|version`.
+        List<String> existing = c.getConcept() != null ? c.getConcept().getCodeSystemVersions() : List.of();
+        if (existing == null || existing.isEmpty()) {
+          List<String> versions = java.util.Optional.ofNullable(v.getVersions()).orElse(List.of()).stream()
+              .map(org.termx.ts.codesystem.CodeSystemVersionReference::getVersion)
+              .filter(java.util.Objects::nonNull).distinct().toList();
+          if (!versions.isEmpty()) {
+            c.getConcept().setCodeSystemVersions(versions);
+          }
+        }
+      }
+    });
+  }
+
+  /**
+   * A member is inactive when its concept version status is retired/deprecated, OR it carries the FHIR
+   * concept-property {@code inactive=true}, OR a {@code status} property of retired/deprecated/inactive — the
+   * tx-ecosystem marks such members {@code inactive} in the expansion and excludes them under {@code activeOnly}.
+   */
+  private static boolean isInactiveMember(ValueSetVersionConcept concept) {
+    if (List.of("retired", "deprecated", "inactive").contains(String.valueOf(concept.getStatus()))) {
+      return true;
+    }
+    return java.util.Optional.ofNullable(concept.getPropertyValues()).orElse(List.of()).stream().anyMatch(pv ->
+        ("inactive".equals(pv.getEntityProperty()) && (Boolean.TRUE.equals(pv.getValue()) || "true".equalsIgnoreCase(String.valueOf(pv.getValue()))))
+            || ("status".equals(pv.getEntityProperty()) && List.of("retired", "deprecated", "inactive").contains(String.valueOf(pv.getValue()))));
+  }
+
+  /** A member is abstract (a grouper, not for direct use) when its concept carries {@code notSelectable=true}. */
+  private static boolean isAbstractMember(ValueSetVersionConcept concept) {
+    return java.util.Optional.ofNullable(concept.getPropertyValues()).orElse(List.of()).stream()
+        .filter(pv -> "notSelectable".equals(pv.getEntityProperty()))
+        .anyMatch(pv -> Boolean.TRUE.equals(pv.getValue()) || "true".equalsIgnoreCase(String.valueOf(pv.getValue())));
   }
 
 
@@ -397,7 +2240,8 @@ public class ValueSetExpandOperation implements InstanceOperationDefinition, Typ
     ValueSetVersion stubVersion = new ValueSetVersion();
 
     String textFilter = req == null ? null : req.findParameter("filter")
-        .map(pp -> pp.getValueString() != null ? pp.getValueString() : pp.getValueCode()).orElse(null);
+        .map(pp -> pp.getValueString() != null ? pp.getValueString()
+            : pp.getValueCode() != null ? pp.getValueCode() : pp.getValueUri()).orElse(null);
     Integer offset = req == null ? null : req.findParameter("offset").map(ParametersParameter::getValueInteger)
         .orElse(req.findParameter("offset").map(ParametersParameter::getValueString).map(Integer::valueOf).orElse(null));
     Integer count = req == null ? null : req.findParameter("count").map(ParametersParameter::getValueInteger)
@@ -516,7 +2360,8 @@ public class ValueSetExpandOperation implements InstanceOperationDefinition, Typ
         .orElse(req.findParameter("defaultLanguage").map(ParametersParameter::getValueCode)
         .orElse(req.findParameter("defaultLanguage").map(ParametersParameter::getValueString).orElse(null))));
     String textFilter = req == null ? null : req.findParameter("filter")
-        .map(pp -> pp.getValueString() != null ? pp.getValueString() : pp.getValueCode()).orElse(null);
+        .map(pp -> pp.getValueString() != null ? pp.getValueString()
+            : pp.getValueCode() != null ? pp.getValueCode() : pp.getValueUri()).orElse(null);
     Integer offset = req == null ? null : req.findParameter("offset").map(ParametersParameter::getValueInteger)
         .orElse(req.findParameter("offset").map(ParametersParameter::getValueString).map(Integer::valueOf).orElse(null));
     Integer count = req == null ? null : req.findParameter("count").map(ParametersParameter::getValueInteger)

@@ -151,4 +151,141 @@ class CodeSystemFhirMapperSpec extends Specification {
     languages.contains("et")
     languages.contains("ru")
   }
+
+  def "meta.profile round-trips: import populates profile, export emits meta.profile"() {
+    given:
+    conceptService.load(_, _) >> Optional.empty()
+    def fhir = new com.kodality.zmei.fhir.resource.terminology.CodeSystem()
+        .setId("cs").setUrl("http://fhir.ee/CodeSystem/cs").setName("cs").setContent("not-present")
+    fhir.setMeta(new com.kodality.zmei.fhir.resource.Meta().setProfile([
+        org.termx.ts.FhirProfile.SHAREABLE_CODE_SYSTEM, "http://example.org/StructureDefinition/custom"]))
+
+    when: "import"
+    def imported = mapper.fromFhirCodeSystem(fhir)
+
+    then: "both the recognized and the custom profile are stored verbatim"
+    imported.profile == [org.termx.ts.FhirProfile.SHAREABLE_CODE_SYSTEM, "http://example.org/StructureDefinition/custom"]
+
+    when: "export the stored profile back out"
+    def version = new CodeSystemVersion().setVersion("1.0.0").setPreferredLanguage("en")
+        .setReleaseDate(LocalDate.parse("2026-06-18")).setStatus(PublicationStatus.draft)
+    def out = mapper.toFhir(imported.setTitle(new LocalizedName([en: "cs"])), version, [])
+
+    then:
+    out.meta.profile == [org.termx.ts.FhirProfile.SHAREABLE_CODE_SYSTEM, "http://example.org/StructureDefinition/custom"]
+  }
+
+  def "no declared profile leaves meta unset on export"() {
+    given:
+    conceptService.load(_, _) >> Optional.empty()
+    def cs = new CodeSystem().setId("cs").setUri("http://fhir.ee/CodeSystem/cs").setName("cs")
+        .setTitle(new LocalizedName([en: "cs"])).setContent("not-present")
+    def version = new CodeSystemVersion().setVersion("1.0.0").setPreferredLanguage("en")
+        .setReleaseDate(LocalDate.parse("2026-06-18")).setStatus(PublicationStatus.draft)
+
+    expect:
+    mapper.toFhir(cs, version, []).meta == null
+  }
+
+  def "fromFhir defaults an absent title and name to the id (derived from the url's last segment)"() {
+    given: "a CodeSystem with neither title nor name nor id — only a url (as many tx-ecosystem fixtures are)"
+    def fhir = new com.kodality.zmei.fhir.resource.terminology.CodeSystem()
+        .setUrl("http://hl7.org/fhir/test/CodeSystem/search")
+        .setStatus("active")
+        .setContent("complete")
+        .setConcept([new com.kodality.zmei.fhir.resource.terminology.CodeSystem.CodeSystemConcept().setCode("a")])
+
+    when:
+    def cs = mapper.fromFhirCodeSystem(fhir)
+
+    then: "title is non-null (TermX stores it NOT NULL) and falls back through name -> id -> url last segment"
+    cs.id == "search"
+    cs.name == "search"
+    cs.title != null
+    cs.title.values().contains("search")
+    and: "the version's code_system FK uses the derived id (else the version insert hits a not-null violation)"
+    cs.versions.first().codeSystem == "search"
+    and: "concept and its entity version also carry the derived code_system id (their FKs are NOT NULL too)"
+    cs.concepts.first().codeSystem == "search"
+    cs.concepts.first().versions.first().codeSystem == "search"
+  }
+
+  def "fromFhir keeps an explicit title and only defaults the missing name"() {
+    given:
+    def fhir = new com.kodality.zmei.fhir.resource.terminology.CodeSystem()
+        .setUrl("http://hl7.org/fhir/test/CodeSystem/simple")
+        .setTitle("Simple CS")
+        .setStatus("active")
+        .setContent("complete")
+
+    when:
+    def cs = mapper.fromFhirCodeSystem(fhir)
+
+    then:
+    cs.name == "simple"
+    cs.title.values().contains("Simple CS")
+  }
+
+  def "a SNOMED-url code system derives the concept display: preferred > FSN > synonym"() {
+    given:
+    def fhir = com.kodality.zmei.fhir.FhirMapper.fromJson('''
+      {"resourceType":"CodeSystem","url":"http://snomed.info/sct","status":"active","content":"complete","language":"en","concept":[
+        {"code":"100","designation":[
+          {"use":{"system":"http://snomed.info/sct","code":"900000000000003001"},"language":"en","value":"Foo (finding)"},
+          {"use":{"system":"http://snomed.info/sct","code":"900000000000013009"},"language":"en","value":"Foo"},
+          {"use":{"system":"http://snomed.info/sct","code":"900000000000548007"},"language":"en","value":"Foo preferred"}]},
+        {"code":"200","designation":[
+          {"use":{"system":"http://snomed.info/sct","code":"900000000000003001"},"language":"en","value":"Bar (finding)"}]},
+        {"code":"300","designation":[
+          {"use":{"system":"http://snomed.info/sct","code":"900000000000013009"},"language":"en","value":"Baz syn"}]}]}''',
+        com.kodality.zmei.fhir.resource.terminology.CodeSystem)
+
+    when:
+    def cs = mapper.fromFhirCodeSystem(fhir)
+
+    then: "preferred wins; else FSN; else synonym"
+    displayOf(cs, "100") == "Foo preferred"
+    displayOf(cs, "200") == "Bar (finding)"
+    displayOf(cs, "300") == "Baz syn"
+  }
+
+  def "a non-SNOMED code system does NOT derive a display from SNOMED designations"() {
+    given:
+    def fhir = com.kodality.zmei.fhir.FhirMapper.fromJson('''
+      {"resourceType":"CodeSystem","url":"http://example.org/x","status":"active","content":"complete","language":"en","concept":[
+        {"code":"a","designation":[
+          {"use":{"system":"http://snomed.info/sct","code":"900000000000013009"},"language":"en","value":"A syn"}]}]}''',
+        com.kodality.zmei.fhir.resource.terminology.CodeSystem)
+
+    when:
+    def cs = mapper.fromFhirCodeSystem(fhir)
+
+    then: "the display-derivation rule is SNOMED-url only"
+    displayOf(cs, "a") == null
+  }
+
+  def "a SNOMED designation use maps to the snomed-synonym designation type"() {
+    given:
+    def fhir = com.kodality.zmei.fhir.FhirMapper.fromJson('''
+      {"resourceType":"CodeSystem","url":"http://example.org/x","status":"active","content":"complete","language":"en","concept":[
+        {"code":"a","display":"A","designation":[
+          {"use":{"system":"http://snomed.info/sct","code":"900000000000013009"},"language":"en","value":"A syn"}]}]}''',
+        com.kodality.zmei.fhir.resource.terminology.CodeSystem)
+
+    when:
+    def cs = mapper.fromFhirCodeSystem(fhir)
+
+    then:
+    designationTypeOf(cs, "a", "A syn") == "snomed-synonym"
+  }
+
+  private static String displayOf(cs, String code) {
+    def concept = cs.concepts.find { it.code == code }
+    concept?.versions?.first()?.designations?.find { it.designationType == "display" }?.name
+  }
+
+  private static String designationTypeOf(cs, String code, String value) {
+    def concept = cs.concepts.find { it.code == code }
+    concept?.versions?.first()?.designations?.find { it.name == value }?.designationType
+  }
 }

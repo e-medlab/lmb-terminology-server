@@ -1,0 +1,274 @@
+# FHIR tx-ecosystem conformance — remaining problems (TODO)
+
+**Status (head):** session 2026-06-21 reached **`400/599`** via #295–#306 (all merged): #301 doc-sync, #302 overload multi-version order, #303 loader-by-resourceType (keystone — stored simple1/simple2/exclude/extensions/big), #304 inferSystem cannot-infer, #305 unknown-system-not-in-vs, #306 inactive validate envelope. Frontend UI follow-ups captured in `termx-web/docs/fhir-tx-ui-todo.md` + `…-roadmap.md`.
+
+**Next-topics investigation (2026-06-21, @400) — all NON-trivial; pick by appetite:**
+- **`deprecated` (5)** — NOT the inactive envelope. `deprecating-validate{,-2}` want a concept-deprecation **warning with a different text** ("The presence of the concept 'X' in the system 'Y' in the value set Z is marked with a status of deprecated…") sourced from the **value set**, not the CS concept; `not-withdrawn-validate` wants CS-level *deprecated* + **imported-VS-level *withdrawn*** status-check info issues (termx emits the CS one, misses the withdrawn-VS one — needs status propagation from an imported/referenced VS). `vs-deprecation` (expand) wants a `contains[].extension`. Moderate; multiple distinct pieces.
+- **`notSelectable` total (noprop-true/false, 2)** — a `compose.include.filter` `notSelectable = true|false` should match ONLY concepts with that property **explicitly** set (codeNS for true / codeS for false; codeU with no property matches neither → total 1); termx returns 2. This is a **SQL `value_set_expand(text)` filter-evaluation** bug (boolean property `=` match), not a Java-layer fix — touches the shared expand SQL, so higher blast radius. (Could not reproduce via hand-bundled tx-resource — the runner's url+injection path differs; debug through a real run.)
+- **`case` (case-insensitive-code1-2/3, 2) — DONE (#307, +2 → 402).** A `caseSensitive=false` CodeSystem validates `CODE1`/`Code1` against `code1`: `result=true` + `normalized-code=code1` + an **information**/`business-rule`/`code-rule` issue ("The code 'CODE1' differs from the correct code 'code1' by case… case insensitive… use the correct case anyway"). Validate-level fallback in `validateInline`: when the exact match fails and the tx-resource CodeSystem has `caseSensitive=false`, match a member case-insensitively, echo the code as-given + `normalized-code` (the member's actual code) + the code-rule note. No expand/SQL change; location form-based (`Coding.code`).
+- **`default-valueset-version` indirect-validation-zero-pinned{,-wrong} (2)** + **`inactive-3a` (1)** — both blocked by the **coding `not-in-vs` location ambiguity** (expected `loc=Coding.code`, but termx's coding not-in-vs emits no location, and other passing coding tests expect none — the same suite-generation-era inconsistency that made `permutations` location a dead end). `inactive-3a` additionally needs the per-status-word 2nd code-comment + `status` param in the **not-found** path (the success-path half shipped in #306). Risky without a per-fixture discriminator the runtime can't see.
+
+**True clean-DB baseline = `349/599`** (the earlier `352` was stale/miscounted — a fresh `loadSetup` run on `389e9637`/#294 measures 349). Session 2026-06-21 (validate-code message/shape fixes, zero regressions): `349` → **[#295]** typed issue locations + `presentVersionList` "a or b" join + error-only combined `message` (`371`) → **[#296]** 404 on unresolvable value set (`+3`) → **[#297]** full reference wording for invalid-display message (`+8`) → **[#298]** inactive issue-text swap (`+1`) → measured **`383/599`** → **[#299]** bad-import tolerance (`+3` → `386`) → **[#300]** broken-filter vs-invalid (`+3` → `389`). **#295–#300 all MERGED → `389/599`.**
+
+**bad-import tolerance (#299, +3):** a `$validate-code` whose value set imports (`compose.include.valueSet`) a canonical the server can't resolve **and no version was requested** degrades to `200 result=false` + a single `error/not-found/not-found` issue ("A definition for the value Set 'X' could not be found", **no location**), not a 404. Discriminator (pinned exactly): the graceful 200 is *operation*-scoped — `$expand` of an unresolvable import stays a hard 4xx (`indirect-expand-zero-pinned-wrong`), and a *wrong pinned version* (ref `|version` or a `default-valueset-version` param → `refVersion != null`) stays on the expand-path 404 (`indirect-*-zero-pinned-wrong`). Validate-only pre-check (`unresolvableVersionlessImport`) using the same tx-resource-only resolution the expand path uses. Flipped `validation-simple-{code,coding,codeableconcept}-bad-import`.
+
+**broken-filter vs-invalid (#300, +3):** a `compose.include/exclude.filter` missing its `value` (1..1 in R5) → 4xx `error/invalid/vs-invalid` ("The system X filter with property = P, op = O has no value", located at the filter) on the **operation TARGET only** (a malformed *supporting* tx-resource stays tolerated, #283). Single guard in `expandInline` (which `$validate-code` also drives). New `TxIssues.vsInvalidException`. Flipped `errors/broken-filter-{expand,validate}` + `broken-filter2-validate`.
+
+**contained value sets (3: `validation-contained-{good,bad}`, `simple-expand-contained`) — DEFERRED, not a clean win.** Resolving `#vs1` from `ValueSet.contained[]` is easy (zmei `DomainResource.getContained()`), BUT the include is `valueSet: ["#vs1", ".../simple-filter-isa"]` and **multiple refs in one include are INTERSECTION, not union** — the existing P8 import code (`resolveImportedValueSets`) unions, so a spike gave `simple-expand-contained` total=5 vs expected 1 (`#vs1 ∩ simple-filter-isa = code2`). Plus `contained-good` needs inactive decoration carried through the import path (exp 9 params / act 5 — retired-code warnings dropped). Proper fix = intersection semantics for multi-`valueSet` includes + inactive-through-import + the `(unidentified)` not-in-vs name for a url-less VS. Bounded but a real feature touching all multi-ref includes; do as a focused effort, not a 2-liner.
+
+**permutations `unexpected property location` (15) — CONFIRMED DEAD END.** The discriminator is *suite-generation-era, not a runtime property*: `validation` CC issues carry `location`+`expression`, `permutations` CC issues carry `expression` only — with **byte-identical request shapes** (same `url`+`codeableConcept`, both `invalid-code`/`this-code-not-in-vs`). No request signal distinguishes them, so emitting expression-only for permutations would regress the `validation` CC cases that currently pass *with* location. Do not attempt without a per-fixture override the runtime can't see. This also blocks `good-cc1-isa` (its `this-code-not-in-vs` is expression-only too) — the display-in-parens text fix is correct but flips nothing while location mismatches.
+
+**Next clean targets (still open after #299/#300; re-measure on `389/599`):**
+- **version not-in-vs param gap (17, exp 8/act 5)** — `code-*-vs1wb`/`*-vbb`: not-in-vs response omits `display` (must be version-correct, e.g. "Display 1 (1.0)"), `version` (=`vr.echoVersion()`), `x-caused-by-unknown-system`. ENTANGLED: `x-caused-by` comes from the VS's *own* bad include version (`version-w-bad`), not the input — needs VS-include bad-version detection in expand; `txCsConcept` must become version-aware.
+- **`$lookup` shape (simple-lookup exp 14/act 8)** — omits designations + properties from the tx-resource CS (P10, Step 6).
+- **`good-cc2` display selection (6)** — multi-coding CC echoes coding[0]'s display; HAPI picks the *valid* coding's (`Display 3`). Rule unclear.
+- **ABANDONED:** the extensions→property feature (deeply multi-layered: param→property-decl→status→designation-merge→designation/contains extension-echo; flips zero tests net). Do not re-attempt without a different approach.
+
+**P1 detail:** display resolved by effective language (request param → VS expansion-parameter ext / VS `language` → CS resource language → Accept-Language header, lowest); exact-language pick over region (`de` vs `de-CH`); alternate designations kept (de-duped, no spurious use/language); validate-code display-severity matches designations only in the requested language. **Remaining language fails (7):** `xform` ×6 + `en-designations` ×1 — BLOCKED by loadSetup designation pollution (canonical collision merges en-multi designations); see P2+xform note below.
+**Companion:** the running history + how-to-run is in `termx-agent/notes/fhir-tx-conformance-baseline.md`. **Reference engine:** `org.hl7.fhir.core` 6.9.10 — get the exact source via Maven `ca.uhn.hapi.fhir:org.hl7.fhir.r5:6.9.10:sources` + `:org.hl7.fhir.utilities:6.9.10:sources`; i18n message templates ship as plain `Messages.properties` at the `validator_cli.jar` root. The fixtures are generated by this engine, so "match the fixture" == "match HAPI".
+
+## Progress (worked autonomously, "go with proposal")
+
+- **P5a — DONE (#276)**: inactive members detected from the tx-resource CodeSystem concept properties (`inactive=true` / `status` retired/deprecated/inactive), flagged `inactive:true` + dropped under `activeOnly`. The DB status decoration is unreliable for tx-resource-only systems, so derive it from the request. `inactive 3→6`, overall **303→306**.
+- **P11 — DONE (#277)**: status warnings. Experimental/draft code systems + deprecated/withdrawn code-systems/value-sets emit `warning-<status>` expansion params and an info `business-rule/status-check` validate issue ("Reference to <status> CodeSystem|ValueSet <url>|<version>"). A value set warns only on standards-status, not draft/experimental. `deprecated 0→6`, overall **306→312**.
+- **P1 — AWAITING YOUR PICK (proposals fully described below).** Reverted patch regressed a `validation` test because the tx-resource display override was global. The language suite needs 4 coupled pieces (see *Precise findings → P1/P2*). Below are the three resolution strategies in full, with mechanism, blast radius, risk, and expected gain, so you can choose:
+
+  **Proposal (a) — Restricted override + designation/extension echoes (my recommendation).**
+  - *Mechanism.* In `ValueSetExpandOperation`, only override a member's `display` from the tx-resource CodeSystem when the request **explicitly** carries a `displayLanguage` (param) or the VS compose declares the `valueset-expansion-parameter` extension with `displayLanguage`. Resolution order: requested-language designation → CS primary `display` → leave the SQL display. When NO language is requested, **do not touch** the display (this is what kills the regression). Additionally: (i) keep an alternate-language `designation` whose `value` ≠ the chosen display (mirror the existing `#270` display-typed filter but compare by value, not type), and add a `noUseDesignations` set so a designation the source stated with no `use` is echoed without one; (ii) read `ValueSet.compose.extension[valueset-expansion-parameter]`, APPLY its `displayLanguage`, and ECHO it back as an `expansion.parameter`.
+  - *Blast radius.* Inline `$expand` + `$validate-code` display/designation only; never changes display when no language is in play.
+  - *Risk.* Low — the regression was the unconditional override; gating on explicit language removes it. Designation echo is additive.
+  - *Expected.* +10–14 (the `language` `*-en`/`*-de`/`*-multi` cases that hinge on requested-language display + the kept alternate designation + the expansion-parameter echo). Won't fix the resource-language `*-none` cases (those need (b)).
+
+  **Proposal (b) — CS-wide display resolver (broadest).**
+  - *Mechanism.* Resolve every member's display through a language-aware resolver keyed off the CodeSystem's `language` and designations, at the stored snapshot/mapper layer (not just inline) — so a member always carries the display for the resource's own language, and requested `displayLanguage` re-selects from designations. Covers the `*-none` cases (no displayLanguage requested but the CS declares a `language`, so the primary display should be the resource-language one).
+  - *Blast radius.* Touches the **stored** expansion path (`ValueSetVersionConceptService`/`ValueSetFhirMapper`) → affects ALL expansions, not just conformance. Needs snapshot re-evaluation.
+  - *Risk.* Higher — changes display selection for existing stored value sets; potential for unrelated display shifts. Needs broad regression checking.
+  - *Expected.* +18–22 (the full `language` suite incl. `*-none`/`*-mixed`), but with the largest regression surface.
+
+  **Proposal (c) — Designation/extension echoes only (smallest, safest).**
+  - *Mechanism.* Skip all display **override** work; only (i) keep the alternate-language designation that differs from the display and (ii) honour + echo the `valueset-expansion-parameter` extension. No change to which `display` is chosen.
+  - *Blast radius.* Designations + one expansion.parameter; display untouched.
+  - *Risk.* Minimal — purely additive.
+  - *Expected.* +4–6 (the designation-echo + extension cases); leaves all display-by-language mismatches failing.
+
+  *My lean: (a)* — best gain-to-risk; (c) is the safe floor; (b) only if you want the whole `language` suite and accept the stored-path risk.
+
+## Precise findings (investigated 2026-06-19, post-#279 @ 316/599)
+
+These are deep-dive findings on the still-open problems, to inform your decisions:
+
+- **P1/P2 (language, ~22+13)** — the language suite has **four coupled sub-issues**, not one; fixing only the display (my reverted patch) is net-negative:
+  1. **Member display by language.** `de-multi` CS has `language: de`, primary `display: "Anzeige 1"`, plus an `en` designation `"Display 1"`. With no `displayLanguage`, expected echoes the **primary** (`Anzeige 1`); we echo the en designation. Overriding from the tx-resource CS primary **fixes language but regresses a `validation` test** (the override is wrong where the SQL display was already right). So the override must be conditional (only when it actually differs from a *resource-language* display), or scoped.
+  2. **Alternate-language designation kept.** `contains[0].designation` should KEEP the `en` "Display 1" designation (value ≠ the de display) with `{language: en, value}` and **no `use`** (source stated none). Our #270 filter drops all display-typed designations with no filter; the fix is value-equality (drop only the one repeating the display) + a `noUseDesignations` set (mirror `noLanguageDesignations`). Both implemented in the reverted P1 patch and are correct — but blocked behind sub-issue 1.
+  3. **`valueset-expansion-parameter` extension.** `valueset-en-en-multi` carries a `compose.extension` of `http://hl7.org/fhir/StructureDefinition/valueset-expansion-parameter` declaring `displayLanguage=en`. The expand must (a) APPLY that displayLanguage, and (b) ECHO it as an `expansion.parameter` (the `Expected:"4" Actual:"3"` diffs). Not yet built.
+  4. **Root `language`** on the expansion ValueSet for `*-mixed` (minor).
+  **Decision needed:** which display strategy (the §Progress (a)/(b)/(c)). I lean (a) restricted override + ship sub-issues 2+3 (the designation echoes + the expansion-parameter extension) — likely +10–14 with no regression.
+
+- **P6 (supplements, parameters ~9 + extensions ~6)** — the supplement is **not** a tx-resource here; it's a stored CodeSystem (`content:"supplement"`, `supplements:<base>`, e.g. `extensions/codesystem-supplement.json` adds `code1`→`{nl, "ectenoot"}`), referenced by the **`useSupplement`** request param (the supplement's canonical url). termx already has `conceptSupplementService.mergeSupplementsIntoExpansion` + `extractUseSupplement`, but the `useSupplement` param path is incomplete (long-standing chip `task_c96a3f8f`). Expected: `$expand`/`$lookup`/`$validate-code` with `useSupplement` layer the supplement's designations/properties onto the base concepts, and echo a `used-supplement` expansion param; `supplement-bad` (useSupplement names a missing supplement) → 4xx. **Decision needed:** finish the `useSupplement` merge in the inline+stored path (it's a real feature, not a conformance hack) — OK to invest? It also needs the supplement loaded in the DB (loadSetup) since it's not sent inline.
+
+- **P7 (enum-nested) — DONE (2026-06-20).** ⚠️ The earlier "ROOT CAUSE PINNED via live DB" analysis (3 enumerated codes + HAPI adds direct children) was **stale** — the `#current` tx-ecosystem fixture changed. The **actual** current `simple-enumerated` (v5.0.0) explicitly enumerates **5** codes — `code1, code2, code3, code2a, code2b` (request `excludeNested:true`) — where `code2a`/`code2b` are **nested under `code2`** in the `simple` CS. So the real question was only whether termx drops the nested enumerated codes. **Empirical check (new `EnumExpandIT`, testcontainers): termx already returns all 5** — CS import flattens nested `concept.concept` into entity rows + the SQL `exact_concepts` join is code+membership (hierarchy-agnostic). The only real gap was the **`abstract` flag**: `code2` (`notSelectable:true`) was rendered `inactive:true` but **not** `abstract:true`. Fixed by computing a `notSelectable` calculated field on `ValueSetVersionConcept` (`ValueSetVersionConceptService.decorate` + carry it through `withDisplay`) and mapping it to `expansion.contains.abstract` (`ValueSetFhirMapper.toFhirExpansionContains`). Now: total=5, all 5 codes, `code2` abstract+inactive, `excludeNested`/`used-codesystem` echoes correct. (Decision was option (b) "all enumerated ⇒ direct children when excludeNested=false" — moot: that diagnosis didn't match the current fixture, and this request uses excludeNested=true; no child-augmentation was needed.) **Residual to confirm in a real conformance run:** termx emits contains in order `[code3,code2b,code2a,code1,code2]` vs HAPI's definition order `[code1,code2,code2a,code2b,code3]` — only matters if TxTester compares the array order-sensitively (prior symptom was a *count* diff, suggesting it does not).
+
+- **P9a (errors 400-cluster) — ✅ DONE (#283), `316→318`.** Root cause (found via wire capture with a logging proxy on `/fhir`): the `txTests` runner bundles a suite's **entire setup as `tx-resource` params on every request**, including the `errors` suite's deliberately-malformed `broken-filter` VS (a `compose.include.filter` with no `value`, which is `1..1` in R5). termx's **own** `@Replaces` validator `org.termx.fhir.ProfileTolerantResourceValidator` (NOT kefhir's — termx overrides it; that's why the kefhir edit had no effect) ran HAPI profile validation over the **whole** input `Parameters` and threw **400** because an *unrelated supporting resource* was malformed. **Fix (termx-local, no kefhir release):** drop profile-validation errors located inside a `parameter[].resource` on the **operation-input** path (`handle(level,op,params)`), keep the **save** path strict. Plus a graceful **unknown-system** degradation in inline `$validate-code` (not-found issue at `system` + `x-caused-by-unknown-system`). Net **+2, zero regressions** (`unknown-system1` + `other/validation-dual-filter-out`).
+  **Remaining errors-suite content gaps (now operation-level, no longer 400) — tractable next:**
+  - **`unknown-system2`** — system (`simpleXX`) is NOT the VS's include system (`simpleX`), so expected has **2 issues**: `error/code-invalid/not-in-vs` at `code` ("The provided code '…simpleXX#code1' was not found in the value set …") **plus** `error/not-found/not-found` at `system` ("A definition for CodeSystem …simpleXX could not be found…" — **note: no single-quotes** around the url, unlike `unknown-system1`). My `unknownSystem` returns only the not-found issue. Fix: a 2-issue variant when the unknown system ≠ the VS include system, with the unquoted message form.
+  - **`combination-ok`** (code in a 2-CS VS, validates true) — expected exactly `[code, display, result=true, system, version]` (5); we return 6 (an extra param — likely an unwanted `issues`/status echo on the success path). Trim the extra.
+  - **`broken-filter-validate`/`broken-filter2-validate`/`broken-filter-expand`** — these expect a **4xx** (the operation TARGET *is* the broken VS, and the engine refuses to expand a filter with no value). My input-tolerance fix correctly lets them reach the operation, which now returns 200 — so this needs **operation-level** broken-filter detection (reject/`invalid` on a `compose.include.filter` missing `value`). Separate, small, and orthogonal to P9a.
+
+## How to read this
+
+Each problem `Pn` below is independent and self-contained: **Symptom** (the tx diff), **Affected** (suites + rough test count), **Root cause**, **Where** (termx code), **HAPI** (reference behaviour), **Proposal**, and a **❓Question** for you to answer before I implement. Answer the questions inline (or tell me "go with your proposal") and I'll work them one by one.
+
+The tx-ecosystem compares the *whole* response exactly (after scrubbing volatile ids/timestamps and `$external:N$`-tagged free text). So a test only flips green when params + every issue's `severity` / FHIR `code` / `tx-issue-type` coding / `location` + counts all match. That is why the remaining work is per-case rather than structural.
+
+Current per-suite gaps (pass/total): `version 144/206`, `permutations 23/56`, `validation 23/54`, `language 4/26`, `overload 10/29`, `parameters 17/35`, `language2 12/25`, `extensions 0/11`, `deprecated 0/11`, `notSelectable 40/50`, `inactive 3/12`, `default-valueset-version 4/12`, `simple-cases 11/18`, `errors 0/7`, `search 0/6`, `exclude 3/8`, `fragment 3/7`, `regex-bad 0/4`, `big 2/5`, `other 0/3`, `case 4/6`, `metadata 0/2`, `translate 0/2`, `tho 0/2`, `batch 0/2`.
+
+---
+
+## P1 — `$expand` display-language resolution (the echoed `display`)
+
+**Symptom:** `string property values differ at .expansion.contains[i].display` and `.parameter[i].valueString Expected:"Display 2aII"`. In `$validate-code`, the echoed `display` is also wrong.
+**Affected:** `language` (~14), `language2` (~9), plus the display half of many `validation` cases. ~25 tests, and it **blocks** P2/P7 from fully landing.
+**Root cause:** the inline expand resolves a member's `display` to the first/primary designation regardless of the requested `displayLanguage`. The rule the engine uses: echo the concept's display **in the requested language**; if the concept has no display in that language, fall back to the concept's **default** display (and, in `$validate-code`, raise a display issue — see P2).
+**Where:** `ValueSetExpandOperation.expandInline` contains-builder (`contain.setDisplay(concept.getDisplay().getName())`) and the snapshot/designation selection in `ValueSetVersionConceptService` / `value_set_expand` SQL. The display-language already flows in via `displayLanguage`/`defaultLanguage`, but the member display is not re-selected per language.
+**HAPI:** `ValueSetExpander`/`CodeSystemUtilities.getDisplay` pick the designation whose `language` matches the requested language (comma-list, with `-` region fallback), else the `CodeSystem.concept.display`.
+**Proposal:** in the inline contains-builder, when `displayLanguage` is set, select the member display from its designations by language (honor comma-separated list + `xx-YY`→`xx` fallback); fall back to the primary display. Source the per-language designation from the member's `additionalDesignations` (already loaded when `includeDesignations`), or from the tx-resource CodeSystem's `concept.designation[].language`.
+**❓Question:** OK to drive display-language selection off `additionalDesignations` + the tx-resource CS designations (no new DB query), accepting that a purely-stored expand without `includeDesignations` keeps today's behaviour? Or do you want a CS-level "display in language" resolver used everywhere (bigger change, touches stored path)?
+
+---
+
+## P2 — `$validate-code` display validation message + echoed display
+
+**Symptom:** `array item count differs at .parameter` (we omit the `issues`/`message` for display-language cases) and wrong `message` text.
+**Affected:** `validation` (~10), part of `language2`. Depends on P1.
+**Root cause / HAPI:** when a `display` is supplied with a `displayLanguage` and the concept has no display in that language, HAPI returns `result=true` (or false) with an **information**-level `invalid-display` issue and the message *"Wrong Display Name 'X' for sys#code. There are no valid display names found for language(s) 'de'. Default display is 'Y'"* — and echoes the **default** display, not the requested-language one. Severity ladder (already half-built in `validateInline`): matches primary → no issue; matches a designation but not the requested language → `information`; matches nothing → `error`, unless `lenient-display-validation` → `warning` (result stays true).
+**Where:** `ValueSetValidateCodeOperation.validateInline` success branch (`displaySeverity` block — already computes severity; needs the language-specific message + the default-display echo). I had this change staged and reverted because it was conformance-neutral *without* P1.
+**Proposal:** land the message variant (done in a reverted patch) **together with P1** so the echoed display is the default and the language-list message matches.
+**❓Question:** confirm the exact message strings are not `$external`-scrubbed for these (I believe they are literal) — if you have access to a tx.fhir.org run, can you confirm? Otherwise I'll match the fixture literal text.
+
+---
+
+## P3 — `codeableConcept` validate-code: decomposition + 3-issue shapes
+
+**Symptom:** `array item count differs at .parameter` (CC valid expects `[code, codeableConcept, display, result, system, version]`; CC bad expects `[codeableConcept, issues, message, result]`) and `properties differ at .parameter[i].resource.issue` (issue count).
+**Affected:** `permutations` (~15: `bad-cc1/cc2`, `good-cc1`), some `validation`.
+**Root cause:** partially fixed (#272/#273 added the "No valid coding was found" + info `this-code-not-in-vs`). Two gaps remain: (a) **`good-cc*`** valid CC must echo the decomposed `code/display/system/version` *and* `codeableConcept` — but some go through the not-found path because the code is reached via a VS-import (see P8); (b) **`bad-cc2`** = a CC whose coding **is** in the CS (so display echoed) but invalid in the VS → issues `[invalid-code, information/this-code-not-in-vs]` with the decomposed params; our split currently can't produce "code found in CS, decomposed echo, but invalid-code".
+**Where:** `ValueSetValidateCodeOperation.validateInline` not-in-vs branch + success branch.
+**HAPI:** `ValueSetValidator.validateCode(CodeableConcept)` iterates codings, building per-coding issues; a coding present in the CS but not the VS yields `invalid-code` (error) + `this-code-not-in-vs` (information), and the result echoes that coding decomposed.
+**Proposal:** add a "code is in the CS but not in the value set, codeableConcept input" sub-case that echoes the decomposed code/display/system/version *and* keeps `codeableConcept`, with the `[invalid-code, info this-code-not-in-vs]` issues.
+**❓Question:** for a multi-coding `codeableConcept`, which coding's metadata is echoed — the first, or the first that resolves in the CS? (HAPI prefers the first that validates; confirm you want that.)
+
+---
+
+## P4 — `version` suite long tail (~62)
+
+**Symptom:** `array item count differs at .parameter` + `string property values differ at .parameter[i]` across the `coding-vXX-vsYY-{default,check,force}` matrix and the `vbb`/mixed edges.
+**Affected:** `version` 62.
+**Root cause:** the version-negotiation layer (resolve/expand/validate) is in place and the base + most override-param cases pass; what remains is the **interaction** of the override params with the **validate-code envelope** (the same display/issue minutiae as P2/P3) plus a few `system-version`/`check` text shapes. There is no single fix — it's the validate-code envelope applied to versioned inputs.
+**Where:** `ValueSetValidateCodeOperation` (resolveVersion is correct; the remaining diffs are param/issue shape).
+**Proposal:** treat this as "P2 + P3 applied to the version fixtures" — it should mostly fall out once P1–P3 land. Re-measure after P1–P3 before doing version-specific work.
+**❓Question:** OK to **defer** P4 until after P1–P3 and only then tabulate the residual version diffs? (Avoids duplicate work.)
+
+---
+
+## P5 — `$expand` total/contains under `activeOnly` / inactive / filters
+
+**Symptom:** `number property values differ at .expansion.total Expected:"1" Actual:"2"`, `properties differ at .expansion.contains[i]: missing property inactive`, `expansion.parameter` count.
+**Affected:** `inactive` (~6), `overload` (~6), `search` (~4), `exclude` (~3), `regex-bad` (~2), `default-valueset-version` (~4), `tho` (2). ~25 tests.
+**Root cause:** several expand-filter behaviours: (a) `activeOnly=true` must drop inactive members (we sometimes keep them → total off by the inactive count); (b) an `inactive` member that *is* kept must carry `inactive:true` (the SQL expand returns members bare; `decorateExpansionFlags` covers the page but some members miss it); (c) filter-based includes (`is-a`, `regex`, `exists`, property `=`/`in`) compute a different total than the reference.
+**Where:** `ValueSetExpandOperation.expandInline` (`excludeInactive`/`decorateExpansionFlags`/`isInactiveMember`) and the `value_set_expand(text)` SQL for filter ops.
+**HAPI:** `ValueSetExpander.handleCompose` applies the filter, then `activeOnly` strips `inactive`/`deprecated`/`retired` members; `expansion.total` is the post-filter count.
+**Proposal:** split into P5a (activeOnly correctness + `inactive` flag on every retained member — Java only) and P5b (filter-op totals — SQL-level, per op). P5a is the cleaner win.
+**❓Question:** for P5b, are you OK touching `value_set_expand(text)` SQL (the filter operators), or should the inline path post-filter in Java (slower but no DB migration)? And: do you want `activeOnly` to also strip `deprecated`/`retired`, or only `inactive`? (HAPI strips all three.)
+
+---
+
+## P6 — CodeSystem **supplements** (`useSupplement`)
+
+NB the fixtures changed: the supplement is a **stored** CodeSystem (`content:"supplement"`, `supplements:<base>`), referenced by the **`useSupplement`** request param (canonical url). It is NOT sent inline as `tx-resource`, so it needs `loadSetup`. termx already has `ConceptSupplementService` (designation layering via `mergeSupplementsIntoExpansion` / `mergeRuntimeSupplements`) + `extractUseSupplement` in the operations.
+
+**Affected:** `parameters` (~9), `extensions` (~6). ~15 tests.
+
+### P6a — `supplement-bad` → not-found error — **DONE (2026-06-20, PR #288)**
+A `useSupplement` naming a supplement the server does not host was silently ignored (200, as if no supplement). Now `ConceptSupplementService.resolveSupplements` throws a 404 `OperationOutcome` (`TxIssues.notFoundException`, `not-found` tx-issue-type, text `"Required supplement not found: <url>"` — tx-ecosystem `VALUESET_SUPPLEMENT_MISSING`) when the url resolves to no CodeSystem. Shared path → covers expand/lookup/validate-code/coding/codeableconcept bad variants. `SupplementMissingIT` green. (A supplement that exists but targets a different base = no-op, not error.)
+
+### P6b — `supplement-good`/`none` — REMAINING (empirically scoped 2026-06-20, `SupplementMissingIT` setup + diagnostic)
+Three independent gaps, in increasing cost:
+1. **`used-supplement` echo — DONE (2026-06-20, PR #289).** Expand no longer echoes the raw `useSupplement` param; `mergeSupplementsIntoExpansion` returns the resolved `(url, version)` and the operation appends `used-supplement=<url>|<version>` (e.g. `…/supplement|0.1.1`) in both stored + inline paths; `useSupplement` added to `EXPANSION_SELECTION_PARAMETERS`. `SupplementExpandEchoIT` green. (`$lookup` still needs its own `used-supplement` param — folded into P6b.2.)
+2. **Supplement designation `source` part + `$lookup` used-supplement (medium, NOT done).** `$lookup`/`$validate` good expect the supplement-contributed designation (`nl "ectenoot"`) rendered with a `source` part = `<supplement>|<version>`, alongside base designations, plus the `used-supplement` param on the lookup response. termx layers the designation value already (marks `supplement=true`) but `Designation` carries no source canonical — needs a transient source field set in `ConceptSupplementService` when marking `supplement=true` (the resolved supplement now has url+version), then emitted as a `source` part in `CodeSystemLookupOperation`. ~2–3 tests; also needs the base designations' exact `use` codings to line up. Bounded but model-touching.
+3. **Supplement property layering + extensions→property machinery (large, partly OUT of P6).** `parameters-expand-supplement-good` expects `code5.property` = `label`,`order`,`prop1`,`status`. Only `prop1` is the supplement's (`prop1=value1`); **`label`/`order`/`weight` come from FHIR concept *extensions* on the base `extensions` CS** (`codesystem-label`, `codesystem-conceptOrder`, `itemWeight`) — a separate "map standard FHIR extensions to expansion properties" feature that the whole `extensions` suite needs, not supplement-specific. termx surfaces **no** properties on `extensions`-CS members (`code5.props=[]`), so the expand-good case is **blocked behind that extensions feature** regardless of supplement work. ALSO: the stored expand emits `used-codesystem=<extensions>|1.0.0` but the versionless source CS expects bare `<extensions>` — the inline path strips this (`versionlessTxCodeSystems`) but the stored path lost the "no source version" signal (import defaults to 1.0.0, indistinguishable from a declared 1.0.0). Both block the expand-good content match.
+
+**Order to ship:** P6b.1 (used-supplement echo) DONE. P6b.2 (lookup designation source) likely flips the `lookup`/`validate` good cases — bounded, model-touching. The `expand`-good cases need the extensions→property feature + stored used-codesystem version-strip first (track separately; larger).
+
+### Step 4 / extensions suite (2026-06-20)
+- **bad-supplement 4xx — DONE.** A value set that REQUIRES a supplement via the `valueset-supplement` extension must have it resolvable, else 404 (`requireDeclaredSupplements` in `expandInline`, hit by `$expand` + inline `$validate-code`). **extensions 0→4** (echo-bad-supplement + validate-code/coding/codeableConcept bad-supplement), zero regressions. Baseline **348→352**.
+- **extensions→property machinery — NOT done (large).** `extensions-echo-all`/`-enumerated` need: (1) tx-resource **supplement auto-apply** (a bundled `content=supplement` CS whose `supplements` matches an expanded system applied even without `useSupplement`, emitting `used-supplement`); (2) map FHIR concept *extensions* → expansion properties — `itemWeight`→`weight` (uri `concept-properties#itemWeight`), `codesystem-label`→`label`, `codesystem-conceptOrder`→`order` — read from the tx-resource CS+supplement (the DB stores none), declared in `expansion.property` + emitted on `contains`. Entangled with deferred P6b.3.
+- **remaining extensions:** `validate-coding-good-supplement[2]` (supplement designation param count), `validate-code-inactive[-display]` (inactive validate shape), `validate-coding-bad-supplement-url` (validating directly against a `content=supplement` url → should be 2xx, termx 400 — separate edge).
+
+---
+
+## P7 — enumerated include misses **nested** concepts
+
+**Symptom:** `array item count differs at .expansion.contains Expected:"5" Actual:"3"` — `code2a`/`code2b` missing.
+**Affected:** `parameters` (`enum-*`, ~4), and contributes to some `permutations`.
+**Root cause:** `value_set_expand(text)` resolves an enumerated `compose.include.concept` list against **top-level** `CodeSystem.concept` only; codes nested under a parent (`concept.concept`) are not found, so they drop from the expansion.
+**Where:** the `value_set_expand(text)` SQL function (concept resolution for explicit-concept includes).
+**HAPI:** flattens the CodeSystem concept tree before matching enumerated codes.
+**Proposal:** flatten nested `concept.concept` when resolving an enumerated include — either in the SQL (recursive CTE over the inline JSON) or by pre-flattening the tx-resource CodeSystem concept tree in `expandInline` before `expandFromJson`.
+**❓Question:** prefer the **Java pre-flatten** (no SQL migration, inline-path only) or the **SQL recursive CTE** (covers stored path too, but a DB change)?
+
+---
+
+## P8 — `compose.include.valueSet` (VS-import) not resolved inline
+
+**Symptom:** `number property values differ at .expansion.total Expected:"2" Actual:"0"`; valid `good-cc*-import` read as not-in-vs.
+**Affected:** `default-valueset-version` (`indirect-*`, ~4), `permutations` `*-import` (~3), scattered.
+**Root cause:** a value set that imports another value set via `compose.include[].valueSet` is not expanded inline — the imported VS (also supplied as `tx-resource`) is ignored, so membership is empty.
+**Where:** `ValueSetExpandOperation.expandInline` / `value_set_expand(text)` — no handling for `include.valueSet`.
+**HAPI:** `ValueSetExpander.includeValueSet` recursively expands the referenced value set and intersects.
+**Proposal:** in `expandInline`, when an include has `valueSet`, resolve each referenced VS from the `tx-resource` set (or stored), expand it, and intersect/union per FHIR compose semantics, before/with the SQL expand.
+
+### P8 — DONE (2026-06-20, branch feat/p8-vs-import)
+`ValueSetExpandOperation.resolveImportedValueSets` (called first in `expandInline`): for each `compose.include[].valueSet`, find the referenced VS among the bundled `tx-resources` (parsing `url|version`; a `default-valueset-version=<url>|<ver>` request param pins a versionless import), recursively expand it (cycle-guarded by a visited set), and rewrite the include into `system`+`concept` entries of the imported members (so the SQL expand + flags + display handle them). Emits a `used-valueset` expansion parameter per resolved import; an unresolvable import (e.g. wrong pinned version) is a 404 with the `url|version` in the text. `ValueSetValidateCodeOperation` now forwards the request's `tx-resource` params to its internal expand so imports resolve there too (this was P2's `#1`). **Full-run: net +10 (336→346), 11 newly passing** — the `default-valueset-version` `indirect-expand-*` cases AND **`permutations/good-{cc1,coding,scd}-import` (the P3 codeableConcept-import cases, unblocked as planned)**. ONE regression: `indirect-validation-zero-pinned` (the import now resolves but the response should carry an imported-VS version `issues` param — deeper, deferred; net of the validate-code forwarding is still strongly positive). Remaining: `indirect-validation-zero-pinned[-wrong]` (issues param).
+
+---
+
+## P9 — wrong HTTP status clusters
+
+**Symptom:** `Response Code fail`:
+- `errors` (~4): **2xx expected, we 400** — `$validate-code` with an unknown **system** should be `200 result=false` + `not-found` issue, not `400`.
+- `big` (~3): **4xx expected, we 200** — an unbounded expand of a very large/`?fhir_vs` set must `4xx` ("too costly / count required").
+- `extensions` (~4), `default-valueset-version` (~1), `validation` (~3): **4xx expected, we 200/other** — bad value-set / bad supplement references.
+- `batch` (2): `$validate-code` **batch** envelope `400`.
+- `translate` (2): `$translate` (ConceptMap) `400`.
+- `other` (~3), `regex-bad`: misc.
+**Affected:** ~25 tests across many suites.
+**Root cause:** several independent: (a) unknown-system in validate-code is thrown as 400 instead of a graceful 200+issue; (b) no expansion-size guard; (c) `$batch`/`$translate` paths reject or are unimplemented for the conformance shape.
+**Where:** `ValueSetValidateCodeOperation` (unknown-system path), `ValueSetExpandOperation` (size guard), the `$batch`/`$translate` operation handlers.
+**Proposal:** treat as sub-tickets — P9a unknown-system→200 (small, ~4 tests), P9b expand size guard (~3), P9c `$batch`/`$translate` shape (needs investigation, ~6).
+**❓Question:** which of P9a/b/c do you want, and in what order? `$translate`/`$batch` may be larger than their test count suggests — worth it, or skip and document?
+
+---
+
+## P10 — `$lookup` response shape (`parameter[].part`)
+
+**Symptom:** `array item count differs at .parameter[i].part` (designation/property `part` groups).
+**Affected:** `parameters` lookup (~2), `fragment` (~3), scattered.
+**Root cause:** `$lookup` returns `designation`/`property` as nested `part` groups; our counts/shape differ (e.g. supplement designations, property value types).
+**Where:** `CodeSystemLookupOperation`.
+**HAPI:** `CodeSystemProvider.lookup` emits one `designation` parameter-group per designation (use/language/value) and one `property` group per property (code/value/description), including supplement-contributed ones.
+**Proposal:** align the `part` groups (after P6 for supplement designations).
+**❓Question:** defer until after P6 (supplements), since several lookup failures are supplement-driven?
+
+---
+
+## P11 — `deprecated` suite (~11)
+
+**Symptom:** `string property values differ at .parameter[i].name` (validate) + `array item count differs at .expansion.parameter` (`withdrawn` expects extra expansion params).
+**Affected:** `deprecated` 11.
+**Root cause:** a `deprecated`/`withdrawn` status on a code/codesystem yields specific `business-rule` issues in validate-code and extra `expansion.parameter` entries (e.g. a `warning-deprecated`/status note) in expand. We don't surface CodeSystem-level status.
+**Where:** `ValueSetValidateCodeOperation` (status issues — partly built for `inactive` in #274) and `ValueSetExpandOperation` (expansion.parameter for status).
+**HAPI:** propagates `CodeSystem.status=deprecated`/concept `status` into `business-rule`/`code-comment` issues and an expansion note.
+**Proposal:** extend the #274 inactive issue logic to `deprecated`/`withdrawn`, and add the deprecated expansion.parameter note.
+**❓Question:** I need the exact expected issue/param shapes for `deprecated` — OK for me to extract them from the fixtures and propose, then you confirm?
+
+---
+
+## P12 — misc small suites
+
+`metadata` (2: TerminologyCapabilities extension/name), `translate` (P9c), `tho` (2: total), `case` (2: case-insensitive validate param shape), `simple-cases` (4: filter/echo edges), `regex-bad` (P5b/P9), `search` (P5b). ~15 tests total, mostly fold into P5/P9 or are one-offs.
+**❓Question:** worth my time individually, or bundle into the relevant parent problem (P5/P9) and skip the true one-offs (`metadata`, `tho`)?
+
+---
+
+## Dependency analysis (2026-06-20) — what blocks what
+
+Done so far: **P5a, P11-partial, P9a, P7 (enum abstract), P6a (bad-supplement 404), P6b.1 (used-supplement echo), P6b.2 (lookup source)**.
+
+**Hard prerequisites (B cannot pass until A lands):**
+- **P1 (display-language) → P2, the `display` half of P7 enum-designations/definitions, the display half of `validation`, and much of P4.** Display resolution is the single biggest upstream dependency: dozens of expand/validate cases assert the echoed `display`/designations. Until display is right, those fail regardless of any other fix. P1 is the **#1 unblock** — and it is gated on your a/b/c strategy pick (still unanswered).
+- **extensions→property machinery → P6b.3 (expand-supplement-good content) AND the whole `extensions` suite.** Mapping FHIR concept extensions (`codesystem-label`, `conceptOrder`, `itemWeight`) to expansion properties is a *separate feature*; expand-good can't match until it exists. NOT supplement work.
+- **stored `used-codesystem` version-strip (versionless CS) → expand content matches across `extensions` + any versionless-CS suite.** Small, broad. The inline path already strips it; the stored path lost the "no source version" signal.
+- **P8 (VS-import inline) + P7 → P3 `import` codeableConcept cases.** Membership of an imported VS must resolve before the import-validate shapes can match.
+- **P6 supplement work → P10 (`$lookup` part shape).** Several lookup `part`-count failures are supplement-driven; **P6b.2 already did the supplement half**. P10's remaining non-supplement `part`/property-value-type shape can follow.
+
+**Cross-cutting (one fix lands rows in several suites):**
+- **P6a (bad-supplement 404) already covers the "bad supplement reference" rows inside P9** (`extensions ~4`, `validation ~3`). So P9's 4xx cluster is partly done.
+- Display (P1) and the validate-issue machinery (P2/P5/P11) share code → high regression surface; change with broad re-runs.
+
+**Independent / parallelizable (no blockers):** P9b (expand size guard), P9c (`$batch`/`$translate`), P11 remainder (deprecated/withdrawn), P5b, P12 one-offs.
+
+**Re-measure checkpoints (avoid wasted effort):**
+- **After P1 lands, re-run before touching P4.** "P4 version tail (~62)" is *mostly display/shape side-effects* — many resolve for free once P1–P3 are in. Hand-fixing P4 first burns effort on tests that fix themselves.
+- A fresh full run is also overdue now (P7/P6a/b.1/b.2 merged but unmeasured).
+
+**Recommended sequence:**
+1. **Re-measure** (confirm the merged delta; baseline is stale at 318).
+2. **P1 (display-language)** — pick a/b/c; biggest unblock, gates P2 + enum/validation/version display.
+3. **P2** (validate display) — falls out of P1's machinery.
+4. **extensions→property** + **stored used-codesystem version-strip** — unblocks the `extensions` suite + P6b.3.
+5. **P8 (VS-import)** → then **P3 import** cases.
+6. **P10** (lookup non-supplement part shape) — supplement half already done.
+7. **P9b/P9c**, **P11 remainder**, **P12** — independent mop-up, parallelizable.
+8. **Re-measure, then P4** version tail — likely mostly free.
+
+Rough ceiling unchanged (~470–500/599). The gating constraint is still the ❓ behaviour decisions (chiefly the **P1 a/b/c pick**).
