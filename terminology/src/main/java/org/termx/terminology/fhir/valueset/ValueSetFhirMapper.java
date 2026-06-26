@@ -1,5 +1,6 @@
 package org.termx.terminology.fhir.valueset;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.kodality.commons.exception.ApiClientException;
 import com.kodality.commons.model.LocalizedName;
 import com.kodality.commons.util.DateUtil;
@@ -29,6 +30,7 @@ import org.termx.ts.codesystem.Designation;
 import org.termx.ts.codesystem.DesignationType;
 import org.termx.ts.codesystem.EntityProperty;
 import org.termx.ts.codesystem.EntityPropertyType;
+import org.termx.ts.codesystem.EntityPropertyValue;
 import org.termx.ts.mapset.MapSet;
 import org.termx.ts.relatedartifact.RelatedArtifactType;
 import org.termx.ts.valueset.ValueSet;
@@ -59,6 +61,7 @@ import com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansion;
 import com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionContains;
 import com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionContainsProperty;
 import com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionParameter;
+import com.kodality.zmei.fhir.resource.terminology.ValueSet.ValueSetExpansionProperty;
 import io.micronaut.context.annotation.Context;
 import io.micronaut.context.annotation.Value;
 import io.micronaut.core.util.CollectionUtils;
@@ -70,10 +73,13 @@ import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.commons.lang3.tuple.Pair;
@@ -89,6 +95,7 @@ public class ValueSetFhirMapper extends BaseFhirMapper {
   private final ValueSetRelatedArtifactService relatedArtifactService;
   private static final String concept_definition = "http://hl7.org/fhir/StructureDefinition/valueset-concept-definition";
   private static final String concept_order = "http://hl7.org/fhir/StructureDefinition/valueset-conceptOrder";
+  private static final String VALUESET_SUPPLEMENT_EXTENSION = "http://hl7.org/fhir/StructureDefinition/valueset-supplement";
 
   public ValueSetFhirMapper(ConceptService conceptService,
                             CodeSystemService codeSystemService, ValueSetService valueSetService, MapSetService mapSetService,
@@ -142,6 +149,9 @@ public class ValueSetFhirMapper extends BaseFhirMapper {
       fhirValueSet.addExtension(toFhirWebSourceExtension(valueSet.getExternalWebSource()));
     }
     fhirValueSet.setId(toFhirId(valueSet, version));
+    if (CollectionUtils.isNotEmpty(valueSet.getProfile())) {
+      fhirValueSet.setMeta(new com.kodality.zmei.fhir.resource.Meta().setProfile(valueSet.getProfile()));
+    }
     fhirValueSet.setUrl(valueSet.getUri());
     fhirValueSet.setName(valueSet.getName());
     if (CollectionUtils.isNotEmpty(valueSet.getOtherTitle())) {
@@ -218,7 +228,7 @@ public class ValueSetFhirMapper extends BaseFhirMapper {
       return null;
     }
     ValueSetCompose compose = new ValueSetCompose();
-    compose.setInactive(ruleSet.isInactive());
+    compose.setInactive(ruleSet.getInactive());
     if (ruleSet.getLockedDate() != null) {
       compose.setLockedDate(ruleSet.getLockedDate().toLocalDate());
     }
@@ -242,7 +252,7 @@ public class ValueSetFhirMapper extends BaseFhirMapper {
       if (rule.getCodeSystemBaseUri() != null) {
         include.setSystem(rule.getCodeSystemBaseUri());
         include.setVersion(baseVersion);
-        fhirValueSet.addExtension(new Extension("http://hl7.org/fhir/StructureDefinition/valueset-supplement").setValueCanonical(PipeUtil.toPipe(rule.getCodeSystemUri(), version)));
+        fhirValueSet.addExtension(new Extension(VALUESET_SUPPLEMENT_EXTENSION).setValueCanonical(PipeUtil.toPipe(rule.getCodeSystemUri(), version)));
         if (rule.getCodeSystem() != null && rule.getCodeSystemVersion() != null) {
           include.setConcept(toFhirConcept(rule.getConcepts(), conceptService.query(new ConceptQueryParams().setCodeSystem(rule.getCodeSystem()).setCodeSystemVersion(rule.getCodeSystemVersion().getVersion()).all()).getData()));
         }
@@ -304,6 +314,41 @@ public class ValueSetFhirMapper extends BaseFhirMapper {
     }).collect(toList());
   }
 
+  /** The FHIR language token systems for a {@code designation} parameter — a {@code system|code} with one of these matches by language. */
+  private static final Set<String> LANGUAGE_SYSTEMS = Set.of("urn:ietf:bcp:47", "http://hl7.org/fhir/ValueSet/languages");
+
+  /**
+   * Whether a designation passes the {@code designation} parameter filter. An empty filter matches everything
+   * (no restriction). A token matches when it equals (or is a language-prefix of) the designation's language,
+   * or equals its use/type code; a {@code system|code} token matches the use coding's system+code, or — when
+   * the system is a language system — the language.
+   */
+  /** The {@code designation} parameter tokens of an $expand request (a language, or a {@code system|code} use/language token), in order. */
+  public static List<String> designationFilterTokens(Parameters param) {
+    return ((param == null) || (param.getParameter() == null)) ? List.of() :
+        param.getParameter().stream().filter(p -> "designation".equals(p.getName()))
+            .map(p -> p.getValueCode() != null ? p.getValueCode() : p.getValueString())
+            .filter(StringUtils::isNotEmpty).toList();
+  }
+
+  public static boolean designationMatchesFilter(Designation d, List<String> tokens) {
+    if (CollectionUtils.isEmpty(tokens)) {
+      return true;
+    }
+    return tokens.stream().anyMatch(token -> {
+      String[] parts = token.contains("|") ? PipeUtil.parsePipe(token) : new String[]{null, token};
+      String system = parts.length > 1 ? parts[0] : null;
+      String code = parts.length > 1 ? parts[1] : parts[0];
+      if (system != null && !LANGUAGE_SYSTEMS.contains(system)) {
+        return code != null && code.equals(d.getDesignationType());
+      }
+      // A designation `language` filter matches the language EXACTLY — `de` selects `de` but NOT `de-CH` (the
+      // reference treats a regional variant as a distinct language for the designation filter).
+      boolean languageMatch = d.getLanguage() != null && code != null && d.getLanguage().equals(code);
+      return languageMatch || (code != null && code.equals(d.getDesignationType()));
+    });
+  }
+
   private static ValueSetComposeIncludeConceptDesignation toFhirDesignation(Designation d) {
     ValueSetComposeIncludeConceptDesignation designation = new ValueSetComposeIncludeConceptDesignation();
     designation.setValue(d.getName());
@@ -329,11 +374,25 @@ public class ValueSetFhirMapper extends BaseFhirMapper {
     // The set of languages carried by the expansion is advertised as repeated `supported-language`
     // extensions on the resource (added in the base toFhir from version.supportedLanguages).
     fhirValueSet.setExpansion(toFhirExpansion(snapshot, fhirValueSet.getCompose().getProperty(), param));
+    // An $expand response is a rendered view, not the value-set definition. The expansion replaces the
+    // compose, and termx stamps an effectivePeriod (defaulting start to the import date) — both are flagged
+    // as unexpected properties by the tx-ecosystem expand tests. Drop them from the expansion view
+    // (compose is read AFTER, above, for declared properties; the read path keeps both).
+    fhirValueSet.setCompose(null);
+    fhirValueSet.setEffectivePeriod(null);
     return fhirValueSet;
   }
 
-  private static ValueSetExpansion toFhirExpansion(ValueSetSnapshot snapshot, List<String> properties, Parameters param) {
+  private static ValueSetExpansion toFhirExpansion(ValueSetSnapshot snapshot, List<String> declaredProperties, Parameters param) {
     List<ValueSetVersionConcept> concepts = snapshot.getExpansion();
+    // A request-level `property` parameter asks for properties to appear in the expansion even when the value
+    // set itself does not declare them (FHIR $expand). Treat the declared properties UNION the requested ones
+    // as the set that may appear in contains.property / expansion.property.
+    List<String> requestedPropertyParams = (param == null || param.getParameter() == null) ? List.of() :
+        param.getParameter().stream().filter(p -> "property".equals(p.getName()))
+            .map(p -> p.getValueCode() != null ? p.getValueCode() : p.getValueString()).filter(StringUtils::isNotEmpty).toList();
+    List<String> properties = java.util.stream.Stream.concat(
+        Optional.ofNullable(declaredProperties).orElse(List.of()).stream(), requestedPropertyParams.stream()).distinct().toList();
 
     boolean active = Optional.ofNullable(param).map(p -> p.findParameter("activeOnly")
         .map(pp -> pp.getValueBoolean() != null ? pp.getValueBoolean() : "true".equals(pp.getValueString()))
@@ -354,8 +413,22 @@ public class ValueSetFhirMapper extends BaseFhirMapper {
     // handing off; fall back to concepts.size() only when the snapshot is
     // un-paginated (e.g. legacy callers).
     expansion.setTotal(snapshot.getConceptsTotal() != null ? snapshot.getConceptsTotal() : concepts.size());
-    expansion.setParameter(toValueSetParameter(param));
+    // expansion.parameter records how the expansion was produced: the echoed control parameters
+    // (activeOnly, excludeNested, count, …) followed by the derived `used-codesystem` entries — one per
+    // distinct code system version that actually contributed a concept. The tx-ecosystem suite asserts
+    // these `used-codesystem` outputs; the selection identifiers (url/valueSet/…) are NOT echoed here.
+    List<ValueSetExpansionParameter> parameters = new ArrayList<>(Optional.ofNullable(toValueSetParameter(param)).orElse(List.of()));
+    parameters.addAll(toUsedCodeSystemParameters(concepts));
+    expansion.setParameter(parameters.isEmpty() ? null : parameters);
     expansion.setTimestamp(snapshot.getCreatedAt());
+
+    // Declare the properties that may appear in contains.property: the value set's declared properties plus
+    // any requested via the `property` parameter, narrowed to the request when one is given. A
+    // contains.property must reference a declared expansion.property to be valid FHIR.
+    expansion.setProperty(properties.stream().distinct()
+        .filter(code -> requestedPropertyParams.isEmpty() || requestedPropertyParams.contains(code))
+        .map(code -> new ValueSetExpansionProperty().setCode(code))
+        .collect(toList()));
 
     if (flat) {
       expansion.setContains(concepts.stream().map(c -> toFhirExpansionContains(c, properties, param)).collect(toList()));
@@ -365,20 +438,94 @@ public class ValueSetFhirMapper extends BaseFhirMapper {
     return expansion;
   }
 
+  // $expand parameters that identify WHICH value set to expand rather than HOW. FHIR records the "how"
+  // params in expansion.parameter but not the selection identifiers, and the tx-ecosystem suite flags an
+  // echoed `url` (etc.) as an unexpected expansion.parameter. Filtered out of the echo below.
+  // `force-system-version` IS echoed (it materially changed the expansion); `system-version`/`check-system-version`
+  // are advisory and the tx-ecosystem does not echo them. `property` selects which concept properties to surface
+  // on contains[] (declared via expansion.property) — it is not echoed as an expansion.parameter either.
+  // `useSupplement` is a request input, not an echoed "how" parameter — the server reports the supplements it
+  // actually applied as derived `used-supplement` parameters (resolved url|version), appended by the operation.
+  private static final Set<String> EXPANSION_SELECTION_PARAMETERS = Set.of("url", "valueSet", "valueSetVersion", "context", "contextDirection",
+      "system-version", "check-system-version", "property", "useSupplement");
+
   private static List<ValueSetExpansionParameter> toValueSetParameter(Parameters param) {
     if (param == null || param.getParameter() == null) {
       return null;
     }
 
-    return param.getParameter().stream().map(p -> new ValueSetExpansionParameter().setName(p.getName())
-        .setValueString(p.getValueString())
-        .setValueBoolean(p.getValueBoolean())
-        .setValueInteger(p.getValueInteger())
-        .setValueDecimal(p.getValueDecimal())
-        .setValueUri(p.getValueUri())
-        .setValueCode(p.getValueCode())
-        .setValueDateTime(p.getValueDateTime())
-    ).toList();
+    return param.getParameter().stream()
+        .filter(p -> !EXPANSION_SELECTION_PARAMETERS.contains(p.getName()))
+        .map(p -> {
+          // The $expand `filter` parameter is a string (the text to match); a request that supplied it as a
+          // uri/code is echoed back as a string, the way the reference engine does (the `search` cases).
+          if ("filter".equals(p.getName())) {
+            String filterValue = p.getValueString() != null ? p.getValueString()
+                : p.getValueUri() != null ? p.getValueUri() : p.getValueCode() != null ? p.getValueCode() : p.getValueUrl();
+            return new ValueSetExpansionParameter().setName(p.getName()).setValueString(filterValue);
+          }
+          return new ValueSetExpansionParameter().setName(p.getName())
+              .setValueString(p.getValueString())
+              .setValueBoolean(p.getValueBoolean())
+              .setValueInteger(p.getValueInteger())
+              .setValueDecimal(p.getValueDecimal())
+              // expansion.parameter.value is a uri (not url/canonical), so fold those in — otherwise a
+              // request param like `url` carried as valueUrl/valueCanonical produced an expansion.parameter
+              // with a name but no value, which is invalid FHIR and crashes strict clients (e.g. the validator).
+              .setValueUri(p.getValueUri() != null ? p.getValueUri() : p.getValueUrl() != null ? p.getValueUrl() : p.getValueCanonical())
+              .setValueCode(p.getValueCode())
+              .setValueDateTime(p.getValueDateTime());
+        }).filter(ValueSetFhirMapper::hasValue).toList();
+  }
+
+  /** A FHIR expansion.parameter MUST have a value — drop any that ended up valueless rather than emit invalid output. */
+  private static boolean hasValue(ValueSetExpansionParameter p) {
+    return p.getValueString() != null || p.getValueBoolean() != null || p.getValueInteger() != null
+        || p.getValueDecimal() != null || p.getValueUri() != null || p.getValueCode() != null
+        || p.getValueDateTime() != null;
+  }
+
+  /**
+   * Derives the {@code used-codesystem} expansion parameters: one {@code valueUri} per distinct code
+   * system version that actually contributed a concept to this expansion, formatted as {@code system|version}
+   * (or bare {@code system} when no version is known). Iteration order is preserved (LinkedHashSet) so the
+   * output is stable. This is an output of the expansion — it reports what was used, not what was requested.
+   */
+  /**
+   * The full {@code expansion.parameter} list — the echoed "how" control parameters followed by the derived
+   * {@code used-codesystem} entries. Exposed so the inline ($expand of a tx-resource value set) path produces
+   * the same shape as the stored-snapshot path.
+   */
+  public static List<ValueSetExpansionParameter> expansionParameters(Parameters param, List<ValueSetVersionConcept> concepts) {
+    // The echoed "how" control parameters are ordered by name (the tx-ecosystem sorts them — e.g.
+    // excludeNested before includeDesignations), followed by the derived used-codesystem entries in member order.
+    List<ValueSetExpansionParameter> parameters = new ArrayList<>(Optional.ofNullable(toValueSetParameter(param)).orElse(List.of()));
+    parameters.sort(java.util.Comparator.comparing(ValueSetExpansionParameter::getName, java.util.Comparator.nullsLast(String::compareTo)));
+    parameters.addAll(toUsedCodeSystemParameters(concepts));
+    return parameters;
+  }
+
+  private static List<ValueSetExpansionParameter> toUsedCodeSystemParameters(List<ValueSetVersionConcept> concepts) {
+    Set<String> uris = new LinkedHashSet<>();
+    for (ValueSetVersionConcept c : concepts) {
+      ValueSetVersionConceptValue v = c.getConcept();
+      if (v == null) {
+        continue;
+      }
+      // A base concept surfaced through a supplement carries baseCodeSystemUri and no version; a regular
+      // concept carries codeSystemUri plus its applicable code system version(s).
+      String system = v.getBaseCodeSystemUri() != null ? v.getBaseCodeSystemUri() : v.getCodeSystemUri();
+      if (system == null) {
+        continue;
+      }
+      List<String> versions = v.getBaseCodeSystemUri() == null ? v.getCodeSystemVersions() : null;
+      if (CollectionUtils.isEmpty(versions)) {
+        uris.add(system);
+      } else {
+        versions.stream().filter(StringUtils::isNotEmpty).forEach(ver -> uris.add(system + "|" + ver));
+      }
+    }
+    return uris.stream().map(uri -> new ValueSetExpansionParameter().setName("used-codesystem").setValueUri(uri)).collect(toList());
   }
 
   private static ValueSetExpansionContains toFhirExpansionContains(ValueSetVersionConcept c, List<String> allProperties, Parameters param) {
@@ -390,7 +537,13 @@ public class ValueSetFhirMapper extends BaseFhirMapper {
             .orElse(false)).orElse(false);
     String lang = Optional.ofNullable(param).map(Resource::getLanguage).orElse(null);
     List<String> properties = ((param == null) || (param.getParameter() == null)) ? List.of() :
-        param.getParameter().stream().filter(p -> "property".equals(p.getName())).map(ParametersParameter::getValueString).toList();
+        param.getParameter().stream().filter(p -> "property".equals(p.getName()))
+            .map(p -> p.getValueCode() != null ? p.getValueCode() : p.getValueString()).filter(StringUtils::isNotEmpty).toList();
+    // FHIR $expand `designation` parameter (0..*): each token names a language or a use. When present, the
+    // expansion's contains[].designation is restricted to designations that match one of them (instead of
+    // emitting every designation). A bare token is a language; a `system|code` token matches a use coding
+    // (or a language when the system is the BCP-47 language system).
+    List<String> designationFilter = designationFilterTokens(param);
 
     ValueSetExpansionContains contains = new ValueSetExpansionContains();
     contains.setCode(c.getConcept().getCode());
@@ -398,14 +551,23 @@ public class ValueSetFhirMapper extends BaseFhirMapper {
     contains.setVersion(c.getConcept().getBaseCodeSystemUri() == null && c.getConcept().getCodeSystemVersions() != null ?
         c.getConcept().getCodeSystemVersions().stream().findFirst().orElse(null) : null);
     contains.setInactive(!c.isActive() ? true : null);
+    contains.setAbstractField(c.isNotSelectable() ? true : null);
     contains.setDisplay(c.getDisplay() == null || (lang != null && !c.getDisplay().getLanguage().startsWith(lang)) ? null : c.getDisplay().getName());
+    // A supplement can contribute the same designation already present on the base concept, so dedup by
+    // (language, value, type) — otherwise the same localized designation is emitted twice in the expansion.
+    Set<String> seenDesignations = new HashSet<>();
     contains.setDesignation(CollectionUtils.isNotEmpty(c.getAdditionalDesignations()) && includeDesignations ? c.getAdditionalDesignations().stream()
         .filter(d -> !"definition".equals(d.getDesignationType()))
+        .filter(d -> designationMatchesFilter(d, designationFilter))
+        .filter(d -> seenDesignations.add(d.getLanguage() + "|" + d.getName() + "|" + d.getDesignationType()))
         .sorted(Comparator.comparing(d -> !d.isPreferred())).map(designation -> {
           ValueSetComposeIncludeConceptDesignation d = new ValueSetComposeIncludeConceptDesignation();
           d.setValue(designation.getName());
           d.setLanguage(designation.getLanguage());
-          d.setUse(new Coding(designation.getDesignationType() == null ? "display" : designation.getDesignationType()));
+          // Reconstruct the use Coding's system+code from the designation type (a known type → its real
+          // {system, code}; an unknown CS-specific type → a bare code), instead of emitting the bare name.
+          d.setUse(org.termx.terminology.fhir.codesystem.CodeSystemFhirMapper.designationUseCoding(
+              designation.getDesignationType() == null ? "display" : designation.getDesignationType()));
           return d;
         }).collect(toList()) : new ArrayList<>());
     if (c.getDisplay() != null && (lang != null && !c.getDisplay().getLanguage().startsWith(lang))) {
@@ -418,8 +580,34 @@ public class ValueSetFhirMapper extends BaseFhirMapper {
           extension.setValueString(d.getName());
           return extension;
         }).toList() : null);
-    contains.setProperty(c.getPropertyValues() == null ? new ArrayList<>() :
-        c.getPropertyValues().stream().filter(p -> CollectionUtils.isEmpty(properties) || properties.contains(p.getEntityProperty())).map(p -> {
+    // Only surface properties the value set declares (compose.property); a request-level `property`
+    // parameter narrows it further. Without this, every internal property leaks into the expansion as an
+    // undeclared `contains.property`, which bloats the response and is not valid per FHIR.
+    contains.setProperty(toFhirContainsProperties(c.getPropertyValues(),
+        code -> allProperties.contains(code) && (CollectionUtils.isEmpty(properties) || properties.contains(code)), lang));
+    if (allProperties.contains("status") && (CollectionUtils.isEmpty(properties) || properties.contains("status"))) {
+      contains.getProperty().add(new ValueSetExpansionContainsProperty().setCode("status").setValueCode(PublicationStatus.getStatus(c.getStatus())));
+    }
+    addAssociations(c, allProperties, properties, contains, "parent");
+    addAssociations(c, allProperties, properties, contains, "groupedBy");
+    return contains;
+  }
+
+  /**
+   * Builds the FHIR {@code contains.property} list from a concept's property values, keeping only those whose
+   * code passes {@code codeAllowed} (deduped). Shared by the stored ($expand of a stored value set) and inline
+   * (tx-resource) expand paths so both render the FHIR $expand {@code property} output the same way.
+   */
+  public static List<ValueSetExpansionContainsProperty> toFhirContainsProperties(List<EntityPropertyValue> propertyValues,
+                                                                                 java.util.function.Predicate<String> codeAllowed, String lang) {
+    if (CollectionUtils.isEmpty(propertyValues)) {
+      return new ArrayList<>();
+    }
+    Set<String> seen = new HashSet<>();
+    return propertyValues.stream()
+        .filter(p -> codeAllowed.test(p.getEntityProperty()))
+        .filter(p -> seen.add(p.getEntityProperty() + "|" + p.getValue()))
+        .map(p -> {
           ValueSetExpansionContainsProperty property = new ValueSetExpansionContainsProperty();
           property.setCode(p.getEntityProperty());
           switch (p.getEntityPropertyType()) {
@@ -429,8 +617,19 @@ public class ValueSetFhirMapper extends BaseFhirMapper {
             case EntityPropertyType.decimal -> property.setValueDecimal(new BigDecimal(String.valueOf(p.getValue())));
             case EntityPropertyType.integer -> property.setValueInteger(Integer.valueOf(String.valueOf(p.getValue())));
             case EntityPropertyType.coding -> {
-              Concept concept = JsonUtil.getObjectMapper().convertValue(p.getValue(), Concept.class);
-              property.setValueCoding(new Coding(concept.getCodeSystem(), concept.getCode()));
+              // Canonical coding shape (code + codeSystem + display + version). The coding-refresh
+              // enrichment (PR #109/#111, bd73af4f) resolves and persists the target version; surface it
+              // on the FHIR Coding the same way CodeSystemFhirMapper does. Legacy shapes (raw Concept)
+              // round-trip without a version, which is acceptable.
+              var coding = p.asCodingValue();
+              if (coding != null && coding.getCodeSystem() != null && coding.getCode() != null) {
+                Coding valueCoding = new Coding(coding.getCodeSystem(), coding.getCode()).setVersion(coding.getVersion());
+                if (coding.getDisplay() != null) {
+                  String displayStr = coding.getDisplay() instanceof String s ? s : JsonUtil.toJson(coding.getDisplay());
+                  valueCoding.setDisplay(codingDisplay(displayStr, lang));
+                }
+                property.setValueCoding(valueCoding);
+              }
             }
             case EntityPropertyType.dateTime -> {
               if (p.getValue() instanceof OffsetDateTime odt) {
@@ -441,18 +640,33 @@ public class ValueSetFhirMapper extends BaseFhirMapper {
             }
           }
           return property;
-        }).collect(toList()));
-    if (allProperties.contains("status") && (CollectionUtils.isEmpty(properties) || properties.contains("status"))) {
-      contains.getProperty().add(new ValueSetExpansionContainsProperty().setCode("status").setValueCode(PublicationStatus.getStatus(c.getStatus())));
-    }
-    addAssociations(c, allProperties, properties, contains, "parent");
-    addAssociations(c, allProperties, properties, contains, "groupedBy");
-    return contains;
+        }).collect(toList());
   }
 
   private static void addAssociations(ValueSetVersionConcept c, List<String> allProperties, List<String> properties, ValueSetExpansionContains contains, String key) {
     if (allProperties.contains(key) && (CollectionUtils.isEmpty(properties) || properties.contains(key)) && c.getAssociations() != null) {
       c.getAssociations().forEach(a -> contains.getProperty().add(new ValueSetExpansionContainsProperty().setCode(key).setValueCode(a.getTargetCode())));
+    }
+  }
+
+  private record CodingDisplay(String language, String name) {}
+
+  /** Resolve a coding value's display (a serialised list of {name, language, ...}) to the name for the requested language. */
+  private static String codingDisplay(String display, String language) {
+    if (display == null) {
+      return null;
+    }
+    try {
+      List<CodingDisplay> names = JsonUtil.getObjectMapper().readValue(display, JsonUtil.getListType(CodingDisplay.class));
+      if (names.isEmpty()) {
+        return null;
+      }
+      if (language == null) {
+        return names.get(0).name();
+      }
+      return names.stream().filter(n -> language.equals(n.language())).map(CodingDisplay::name).findFirst().orElseGet(() -> names.get(0).name());
+    } catch (JsonProcessingException e) {
+      return display;
     }
   }
 
@@ -466,17 +680,24 @@ public class ValueSetFhirMapper extends BaseFhirMapper {
     return rootConcepts.stream()
         .map(c -> {
           ValueSetExpansionContains contains = toFhirExpansionContains(c, properties, param);
-          contains.setContains(getChildConcepts(targetCodeConcepts, c.getConcept().getCode(), properties, param));
+          contains.setContains(getChildConcepts(targetCodeConcepts, c.getConcept().getCode(), properties, param, Set.of(c.getConcept().getCode())));
           return contains;
         }).toList();
   }
 
   private static List<ValueSetExpansionContains> getChildConcepts(Map<String, List<ValueSetVersionConcept>> targetCodeConcepts, String targetCode,
-                                                                  List<String> properties, Parameters param) {
+                                                                  List<String> properties, Parameters param, Set<String> ancestors) {
     return targetCodeConcepts.getOrDefault(targetCode, List.of()).stream()
+        // Stop a branch whose concept is already on the path from the root: a cyclic association
+        // (self-loop or A->B->A) would otherwise recurse forever. A concept may still appear under
+        // multiple distinct parents (diamond), only an ancestor-of-itself is cut.
+        .filter(c -> !ancestors.contains(c.getConcept().getCode()))
         .map(c -> {
           ValueSetExpansionContains contains = toFhirExpansionContains(c, properties, param);
-          contains.setContains(getChildConcepts(targetCodeConcepts, c.getConcept().getCode(), properties, param));
+          String code = c.getConcept().getCode();
+          Set<String> branch = new HashSet<>(ancestors);
+          branch.add(code);
+          contains.setContains(getChildConcepts(targetCodeConcepts, code, properties, param, branch));
           return contains;
         }).toList();
   }
@@ -588,11 +809,20 @@ public class ValueSetFhirMapper extends BaseFhirMapper {
 
   public static ValueSet fromFhirValueSet(com.kodality.zmei.fhir.resource.terminology.ValueSet valueSet) {
     ValueSet vs = new ValueSet();
-    vs.setId(ValueSetFhirMapper.parseCompositeId(valueSet.getId())[0]);
+    vs.setId(ValueSetFhirMapper.fhirIdOrFromUrl(valueSet.getId(), valueSet.getUrl()));
+    if (valueSet.getMeta() != null && CollectionUtils.isNotEmpty(valueSet.getMeta().getProfile())) {
+      vs.setProfile(valueSet.getMeta().getProfile());
+    }
     vs.setUri(valueSet.getUrl());
     vs.setPublisher(valueSet.getPublisher());
-    vs.setName(valueSet.getName());
-    vs.setTitle(fromFhirName(valueSet.getTitle(), valueSet.getLanguage(), valueSet.getPrimitiveElement("title")));
+    // FHIR name and title are optional, but TermX stores title NOT NULL. Fall back title -> name -> id;
+    // id itself already derives from the url's last segment when absent (see fhirIdOrFromUrl above), so a
+    // resource carrying only a url still loads instead of hitting the not-null constraint.
+    String name = StringUtils.isNotEmpty(valueSet.getName()) ? valueSet.getName() : vs.getId();
+    vs.setName(name);
+    vs.setTitle(fromFhirName(
+        StringUtils.isNotEmpty(valueSet.getTitle()) ? valueSet.getTitle() : name,
+        valueSet.getLanguage(), valueSet.getPrimitiveElement("title")));
     vs.setDescription(fromFhirName(valueSet.getDescription(), valueSet.getLanguage(), valueSet.getPrimitiveElement("description")));
     vs.setPurpose(fromFhirName(valueSet.getPurpose(), valueSet.getLanguage(), valueSet.getPrimitiveElement("purpose")));
     vs.setNarrative(valueSet.getText() == null ? null : valueSet.getText().getDiv());
@@ -616,14 +846,17 @@ public class ValueSetFhirMapper extends BaseFhirMapper {
     return new ValueSetSnapshot().setExpansion(expansion.setTimestamp(expansion.getTimestamp()).getContains().stream().map(c -> new ValueSetVersionConcept()
         .setConcept(new ValueSetVersionConceptValue().setCode(c.getCode()).setCodeSystemUri(c.getSystem()))
         .setDisplay(new Designation().setName(c.getDisplay()).setLanguage(Optional.ofNullable(valueSet.getLanguage()).orElse(Language.en)))
-        .setAdditionalDesignations(Optional.ofNullable(c.getDesignation()).orElse(List.of()).stream().map(d -> new Designation().setName(d.getValue()).setLanguage(d.getLanguage())).toList())
+        .setAdditionalDesignations(Optional.ofNullable(c.getDesignation()).orElse(List.of()).stream()
+            .map(d -> new Designation().setName(d.getValue()).setLanguage(d.getLanguage()).setDesignationType(fromFhirDesignationType(d))).toList())
         .setActive(c.getInactive() == null || !c.getInactive())
     ).toList());
   }
 
   private static ValueSetVersion fromFhirVersion(com.kodality.zmei.fhir.resource.terminology.ValueSet valueSet) {
     ValueSetVersion version = new ValueSetVersion();
-    version.setValueSet(valueSet.getId());
+    // Use the same id the value set resolves to (derived from the url's last segment when the resource
+    // carries no explicit id) — otherwise the version's value_set FK is null for id-less fixtures.
+    version.setValueSet(fhirIdOrFromUrl(valueSet.getId(), valueSet.getUrl()));
     version.setVersion(valueSet.getVersion() == null ? "1.0.0" : valueSet.getVersion());
     version.setStatus(PublicationStatus.draft);
     version.setAlgorithm(valueSet.getVersionAlgorithmString());
@@ -652,15 +885,54 @@ public class ValueSetFhirMapper extends BaseFhirMapper {
       return null;
     }
     ValueSetVersionRuleSet ruleSet = new ValueSetVersionRuleSet();
-    ruleSet.setInactive(valueSet.getCompose().getInactive() != null && valueSet.getCompose().getInactive());
+    // Preserve the tri-state: absent compose.inactive stays null (server default), not coerced to false.
+    ruleSet.setInactive(valueSet.getCompose().getInactive());
     if (valueSet.getCompose().getLockedDate() != null) {
       ruleSet.setLockedDate(valueSet.getCompose().getLockedDate().atStartOfDay().atZone(ZoneId.systemDefault()).toOffsetDateTime());
     }
     ruleSet.setRules(fromFhirRules(valueSet.getCompose().getInclude(), valueSet.getCompose().getExclude()));
+    applyValueSetSupplement(valueSet, ruleSet);
     if (CollectionUtils.isNotEmpty(valueSet.getCompose().getProperty())) {
       ruleSet.getRules().forEach(r -> r.setProperties(valueSet.getCompose().getProperty()));
     }
     return ruleSet;
+  }
+
+  /**
+   * Round-trips the {@code valueset-supplement} extension that {@link #toFhirCompose} emits: each
+   * include carries the BASE code system in {@code system}, and one extension per supplement-bound
+   * rule carries the supplement canonical ({@code supplementUri|version}). Binds the include rule(s)
+   * to the supplement (recording the base in {@code codeSystemBaseUri}) so $expand surfaces the
+   * supplement's designations.
+   *
+   * <p>The extension is VS-level and carries no link to a specific include, so it can only be paired
+   * by order — which is safe only when EVERY include is supplement-bound (the export emits one
+   * extension per include in the same order). A mix of plain and supplement includes is ambiguous
+   * (we can't tell which includes the extensions belong to) and is left untouched. Issue #47.
+   */
+  private static void applyValueSetSupplement(com.kodality.zmei.fhir.resource.terminology.ValueSet valueSet, ValueSetVersionRuleSet ruleSet) {
+    List<Extension> supplements = valueSet.getExtensions(VALUESET_SUPPLEMENT_EXTENSION).toList();
+    List<ValueSetVersionRule> includes = ruleSet.getRules() == null ? List.of() :
+        ruleSet.getRules().stream().filter(r -> ValueSetVersionRuleType.include.equals(r.getType())).toList();
+    if (supplements.isEmpty() || includes.size() != supplements.size()) {
+      return;
+    }
+    for (int i = 0; i < includes.size(); i++) {
+      bindSupplement(includes.get(i), supplements.get(i).getValueCanonical());
+    }
+  }
+
+  private static void bindSupplement(ValueSetVersionRule rule, String supplementCanonical) {
+    if (StringUtils.isEmpty(supplementCanonical)) {
+      return;
+    }
+    String[] parts = PipeUtil.parsePipe(supplementCanonical);
+    String baseVersion = rule.getCodeSystemVersion() == null ? null : rule.getCodeSystemVersion().getVersion();
+    rule.setCodeSystemBaseUri(rule.getCodeSystemUri());
+    rule.setCodeSystemUri(parts[0]);
+    rule.setCodeSystemVersion(new CodeSystemVersionReference()
+        .setVersion(parts.length > 1 ? parts[1] : null)
+        .setBaseCodeSystemVersion(baseVersion == null ? null : new CodeSystemVersionReference().setVersion(baseVersion)));
   }
 
   private static List<ValueSetVersionRule> fromFhirRules(List<ValueSetComposeInclude> include, List<ValueSetComposeInclude> exclude) {
@@ -705,9 +977,17 @@ public class ValueSetFhirMapper extends BaseFhirMapper {
     return designation.stream().map(d -> new Designation()
         .setLanguage(d.getLanguage() == null ? Language.en : d.getLanguage())
         .setName(d.getValue())
+        .setDesignationType(fromFhirDesignationType(d))
         .setDesignationKind("text")
         .setCaseSignificance(CaseSignificance.entire_term_case_insensitive)
         .setStatus(PublicationStatus.active)).toList();
+  }
+
+  /** Recover the designation type from a FHIR designation's {@code use} code. Only the code is read
+   *  (the bare-Coding shape TermX emits, see toFhir*); a missing use leaves the type unset rather than
+   *  fabricating "display". */
+  private static String fromFhirDesignationType(ValueSetComposeIncludeConceptDesignation d) {
+    return d.getUse() == null ? null : d.getUse().getCode();
   }
 
   private static List<ValueSetRuleFilter> fromFhirFilters(List<ValueSetComposeIncludeFilter> filters) {

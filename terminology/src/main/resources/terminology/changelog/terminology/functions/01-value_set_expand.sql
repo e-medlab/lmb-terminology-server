@@ -236,7 +236,10 @@ expressions as (
      and t.rule_id = c.rule_id
      and (t.filter_ -> 'property' ->> 'name')::text = 'code' and (
          (t.filter_ ->> 'operator')::text = '=' and c.csev_code = (t.filter_ ->> 'value')::text or -- code equals the provided value
-         (t.filter_ ->> 'operator')::text = 'regex' and c.csev_code = any(regexp_match(c.csev_code, (t.filter_ ->> 'value')::text||'$')) or -- code matches the regex
+         -- FHIR filter regex matches the ENTIRE code: anchor both ends as `^(value)$`. The previous
+         -- `= any(regexp_match(code, value||'$'))` form only anchored the tail and compared against a
+         -- captured group, so a value with its own group (e.g. `(a+)+`) matched nothing. (#310)
+         (t.filter_ ->> 'operator')::text = 'regex' and c.csev_code ~ ('^(' || (t.filter_ ->> 'value')::text || ')$') or -- code matches the regex (full match)
          (t.filter_ ->> 'operator')::text = 'in' and c.csev_code = any(string_to_array((t.filter_ ->> 'value')::text, ',')) or -- code is in the set
          (t.filter_ ->> 'operator')::text = 'not-in' and c.csev_code != all(string_to_array((t.filter_ ->> 'value')::text, ',')) -- code is not in the set
      )
@@ -260,10 +263,12 @@ expressions as (
                           -- not guaranteed. ->> gives '{"code":"X",…}' for objects, 'true'/'false' for
                           -- JSON booleans — comparison is then a plain text equality, never throws.
                           (t.filter_ ->> 'operator')::text = 'exists' and (t.filter_ ->> 'value')::text = 'true' or
-                          (t.filter_ ->> 'operator')::text = '=' and (epv.value::jsonb = (t.filter_ -> 'value') or (epv.value ->> 'code')::text = (t.filter_ ->> 'value')::text) or
-                          (t.filter_ ->> 'operator')::text = 'regex' and (epv.value::text = any(regexp_match(epv.value::text, (t.filter_ ->> 'value')::text||'$')) or (epv.value ->> 'code')::text = any(regexp_match((epv.value ->> 'code')::text, (t.filter_ ->> 'value')::text||'$'))) or
-                          (t.filter_ ->> 'operator')::text = 'in' and (epv.value::text = any(string_to_array((t.filter_ ->> 'value')::text, ',')) or (epv.value ->> 'code')::text = any(string_to_array((t.filter_ ->> 'value')::text, ','))) or
-                          (t.filter_ ->> 'operator')::text = 'not-in' and (epv.value::text != all(string_to_array((t.filter_ ->> 'value')::text, ',')) and (epv.value ->> 'code')::text != all(string_to_array((t.filter_ ->> 'value')::text, ',')))
+                          -- scalar values are read with `#>> '{}'` (UNQUOTED text); `::text` would keep
+                          -- the jsonb quotes and never match a plain string. Coding values via ->> 'code'.
+                          (t.filter_ ->> 'operator')::text = '=' and (epv.value::jsonb = (t.filter_ -> 'value') or (epv.value #>> '{}') = (t.filter_ ->> 'value')::text or (epv.value ->> 'code')::text = (t.filter_ ->> 'value')::text) or
+                          (t.filter_ ->> 'operator')::text = 'regex' and ((epv.value #>> '{}') = any(regexp_match((epv.value #>> '{}'), (t.filter_ ->> 'value')::text||'$')) or (epv.value ->> 'code')::text = any(regexp_match((epv.value ->> 'code')::text, (t.filter_ ->> 'value')::text||'$'))) or
+                          (t.filter_ ->> 'operator')::text = 'in' and ((epv.value #>> '{}') = any(string_to_array((t.filter_ ->> 'value')::text, ',')) or (epv.value ->> 'code')::text = any(string_to_array((t.filter_ ->> 'value')::text, ','))) or
+                          (t.filter_ ->> 'operator')::text = 'not-in' and ((epv.value #>> '{}') != all(string_to_array((t.filter_ ->> 'value')::text, ',')) and coalesce(epv.value ->> 'code', '') != all(string_to_array((t.filter_ ->> 'value')::text, ',')))
                      ))
           -- Same text-vs-boolean swap as above; symmetric for 'exists = false'.
           or (t.filter_ ->> 'operator')::text = 'exists' and (t.filter_ ->> 'value')::text = 'false' and
@@ -289,8 +294,10 @@ expressions as (
                          (t.filter_ ->> 'operator')::text = 'not-in' and d.name != all(string_to_array((t.filter_ ->> 'value')::text, ','))
                     ))
   union
-  -- all recursive (hierarchical) concepts calculated before
-  select c.*, r.rn, r.fcnt, r.level from c
+  -- all recursive (hierarchical) concepts calculated before.
+  -- is-not-a concepts come from the left-joined `r` being NULL, so fall back to the filter row `t`
+  -- for rn/fcnt — otherwise their rn is NULL and the AND check (#196) would drop them.
+  select c.*, coalesce(r.rn, t.rn), coalesce(r.fcnt, t.fcnt), r.level from c
   left join r  on c.code_system = r.code_system  and c.rule_id = r.rule_id  and c.csev_id = r.csev_id
   left join rc on c.code_system = rc.code_system and c.rule_id = rc.rule_id and c.csev_id = rc.csev_id
   left join t  on t.code_system = c.code_system  and t.rule_id = c.rule_id
@@ -312,9 +319,13 @@ expressions as (
      and rc.operator <> 'is-not-a'
 ),
 expression_concepts as (
-  select rule_id, type, csev_code, obj, fcnt, count(*)
+  -- A rule's filters combine with logical AND (FHIR compose.include[].filter[]): a concept is kept
+  -- only when it matched every filter of the rule. Each row in `expressions` carries the rn of the
+  -- filter that produced it, so a concept that satisfied all `fcnt` filters has `fcnt` distinct rn. (#196)
+  select rule_id, type, csev_code, obj, fcnt
     from expressions
    group by rule_id, type, csev_code, obj, fcnt
+  having count(distinct rn) = fcnt
 ),
 cs_all as (
   select t.rule_id, t."type", t.code_system, t.original_code_system_version_id, t.code_system_version_id, csev.id csev_id, csev.code csev_code,

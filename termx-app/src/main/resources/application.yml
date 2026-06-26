@@ -121,8 +121,26 @@ github:
   app-id: ${GITHUB_APP_ID}
   app-name: ${GITHUB_APP_NAME}
   private-key-path: '/path/to/private-key.pem'
+
+# External LOINC FHIR terminology server (default the official fhir.loinc.org). When configured, TermX
+# resolves http://loinc.org codes by delegating $lookup/$validate-code there instead of importing LOINC.
+loinc:
+  url: ${LOINC_URL:`https://fhir.loinc.org`}
+  # Full Authorization header value (the server is HTTP Basic), e.g. "Basic <base64 user:pass>". Empty = off.
+  authentication: ${LOINC_AUTHENTICATION:}
+  # local | local-first | external — see LoincCodeSystemProvider.
+  source: ${LOINC_SOURCE:local-first}
+
 terminology-ecosystem:
   coordination-server-url: ${TERMINOLOGY_ECOSYSTEM_URL:http://tx.fhir.org/tx-reg}
+
+kefhir:
+  validation:
+    # TermX IS the terminology authority — it validates codes through its own operations
+    # ($validate-code/$expand), not the inbound FHIR profile validator. Strict terminology checks on
+    # inbound resources reject ones referencing code systems not in the validator's context (e.g. a
+    # passed-in tx-resource's CodeSystem.versionAlgorithm), which 400s otherwise-valid operation calls.
+    no-terminology-checks: ${KEFHIR_NO_TERMINOLOGY_CHECKS:true}
 
 chef.url: https://demo.termx.org/chef
 #github:
@@ -134,6 +152,18 @@ chef.url: https://demo.termx.org/chef
 termx:
   web-url: https://demo.termx.org
   api-url: https://demo.termx.org/api
+  # FHIR terminology conformance testing (tx-ecosystem suite via the FHIR validator's txTests).
+  # validator-jar: absolute path to validator_cli.jar (NOT bundled — provided by the deployment, e.g.
+  # downloaded in the Dockerfile). tx-url: this server's externally-reachable FHIR base for -tx.
+  conformance:
+    validator-jar: ${TERMX_CONFORMANCE_VALIDATOR_JAR:}
+    tx-url: ${TERMX_CONFORMANCE_TX_URL:`http://localhost:8200/fhir`}
+    # Optional: dir holding the tx-ecosystem test fixtures to load when a run requests loadSetup=true.
+    # Defaults to the FHIR validator's package cache (~/.fhir/packages/hl7.fhir.uv.tx-ecosystem#current/package/tests).
+    test-package-dir: ${TERMX_CONFORMANCE_TEST_PACKAGE_DIR:}
+    # Bearer token the setup loader uses to write fixtures over HTTP (writes need CodeSystem/ValueSet
+    # create+update privileges — unauthenticated guest writes are 403). Locally this is the dev token.
+    setup-auth-token: ${TERMX_CONFORMANCE_SETUP_AUTH_TOKEN:}
   fhir:
     codesystem:
       lookup:

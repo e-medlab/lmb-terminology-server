@@ -113,6 +113,9 @@ public class ConceptMapFhirMapper extends BaseFhirMapper {
         fhirConceptMap.addExtension(toFhirWebSourceExtension(mapSet.getExternalWebSource()));
     }
     fhirConceptMap.setId(toFhirId(mapSet, version));
+    if (CollectionUtils.isNotEmpty(mapSet.getProfile())) {
+      fhirConceptMap.setMeta(new com.kodality.zmei.fhir.resource.Meta().setProfile(mapSet.getProfile()));
+    }
     fhirConceptMap.setUrl(mapSet.getUri());
     fhirConceptMap.setPublisher(conceptService.load("publisher", mapSet.getPublisher()).flatMap(Concept::getLastVersion).flatMap(CodeSystemEntityVersion::getDisplay).orElse(mapSet.getPublisher()));
     fhirConceptMap.setName(mapSet.getName());
@@ -191,7 +194,12 @@ public class ConceptMapFhirMapper extends BaseFhirMapper {
   }
 
   private List<ConceptMapGroup> toFhirGroup(List<MapSetAssociation> associations, MapSetVersionScope scope, String preferredLanguage) {
-    if (associations == null) {
+    // No associations => no groups to emit. Bail out before buildDisplayMap(), which would otherwise
+    // load every concept in the scope's code systems / expand its value sets just to populate display
+    // lookups that are only ever read inside the per-association loop below. This is the lightweight
+    // (?_summary=true) path and the read path with associations skipped; both previously paid that cost
+    // for nothing and timed out on large-scope ConceptMaps.
+    if (associations == null || associations.isEmpty()) {
       return new ArrayList<>();
     }
     List<MapSetResourceReference> allCS = new ArrayList<>();
@@ -333,10 +341,16 @@ public class ConceptMapFhirMapper extends BaseFhirMapper {
   public MapSet fromFhir(ConceptMap cm) {
     MapSet ms = new MapSet();
     ms.setId(ConceptMapFhirMapper.parseCompositeId(cm.getId())[0]);
+    if (cm.getMeta() != null && CollectionUtils.isNotEmpty(cm.getMeta().getProfile())) {
+      ms.setProfile(cm.getMeta().getProfile());
+    }
     ms.setUri(cm.getUrl());
     ms.setPublisher(cm.getPublisher());
     ms.setName(cm.getName());
-    ms.setTitle(fromFhirName(cm.getTitle(), cm.getLanguage(), cm.getPrimitiveElement("title")));
+    // FHIR title is optional, but TermX stores it NOT NULL — default an absent title to the resource name.
+    ms.setTitle(fromFhirName(
+        StringUtils.isNotEmpty(cm.getTitle()) ? cm.getTitle() : cm.getName(),
+        cm.getLanguage(), cm.getPrimitiveElement("title")));
     ms.setDescription(fromFhirName(cm.getDescription(), cm.getLanguage(), cm.getPrimitiveElement("description")));
     ms.setPurpose(fromFhirName(cm.getPurpose(), cm.getLanguage(), cm.getPrimitiveElement("purpose")));
     ms.setNarrative(cm.getText() == null ? null : cm.getText().getDiv());

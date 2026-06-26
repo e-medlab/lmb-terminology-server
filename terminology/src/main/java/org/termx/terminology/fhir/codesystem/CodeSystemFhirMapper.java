@@ -57,7 +57,60 @@ public class CodeSystemFhirMapper extends BaseFhirMapper {
   private final CodeSystemRelatedArtifactService relatedArtifactService;
   private static final String DISPLAY = "display";
   private static final String DEFINITION = "definition";
-  private static final Set<String> IMPLICIT_PROPERTY_DEFINITIONS = Set.of(DISPLAY, DEFINITION);
+  // A use-less FHIR designation that is NOT the concept's display is stored under this designation-property type
+  // (FHIR: designation.use is optional, and its absence does NOT mean "display"). Implicit so it is always defined
+  // (designations of this type would otherwise be dropped, having no matching property) yet not re-emitted as a
+  // property definition on export.
+  private static final String ALTERNATE = "alternate";
+  private static final Set<String> IMPLICIT_PROPERTY_DEFINITIONS = Set.of(DISPLAY, DEFINITION, ALTERNATE);
+  private static final String SNOMED_URL = "http://snomed.info/sct";
+  // Well-known designation `use` codings (keyed by `system#code`) ↔ the termx defined designation-property
+  // name. Mapping a use to its known name lets a designation link to the shared defined property (by name)
+  // and round-trip its system+code; an unknown use keeps its bare code (a CS-specific type) and is logged.
+  private static final Map<String, String> DESIGNATION_USE_NAME = Map.of(
+      "http://terminology.hl7.org/CodeSystem/designation-usage#display", DISPLAY,
+      "https://termx.org/fhir/CodeSystem/designation-usage#definition", DEFINITION,
+      "https://termx.org/fhir/CodeSystem/designation-usage#alias", "alias",
+      SNOMED_URL + "#900000000000013009", "snomed-synonym",
+      SNOMED_URL + "#900000000000003001", "snomed-fsn",
+      SNOMED_URL + "#900000000000548007", "snomed-preferred");
+  // Reverse: a known designation-property name → its use Coding {system, code}, for export reconstruction.
+  private static final Map<String, String[]> DESIGNATION_NAME_USE = Map.of(
+      DISPLAY, new String[]{"http://terminology.hl7.org/CodeSystem/designation-usage", "display"},
+      DEFINITION, new String[]{"https://termx.org/fhir/CodeSystem/designation-usage", "definition"},
+      "alias", new String[]{"https://termx.org/fhir/CodeSystem/designation-usage", "alias"},
+      "snomed-synonym", new String[]{SNOMED_URL, "900000000000013009"},
+      "snomed-fsn", new String[]{SNOMED_URL, "900000000000003001"},
+      "snomed-preferred", new String[]{SNOMED_URL, "900000000000548007"});
+  // SNOMED concepts carry their label as designations; with no explicit display, derive it in this priority.
+  private static final List<String> SNOMED_DISPLAY_PRIORITY = List.of("snomed-preferred", "snomed-fsn", "snomed-synonym");
+
+  /** Resolves a FHIR designation.use to a termx designation-property name: a known use → its defined name; otherwise the bare code (a CS-specific type), logged. */
+  private static String designationUseName(Coding use) {
+    if (use == null || use.getCode() == null) {
+      return DISPLAY;
+    }
+    String key = (use.getSystem() != null ? use.getSystem() + "#" : "") + use.getCode();
+    String mapped = DESIGNATION_USE_NAME.get(key);
+    if (mapped != null) {
+      return mapped;
+    }
+    if (use.getSystem() != null) {
+      log.warn("Unrecognised designation.use '{}' — kept as code-only type '{}'. Consider adding a defined designation property.", key, use.getCode());
+    }
+    return use.getCode();
+  }
+
+  /** The use Coding for an exported designation: a known designation-property name → its {system, code}; otherwise a bare code. Shared with $expand/$lookup. */
+  public static Coding designationUseCoding(String designationType) {
+    String[] sysCode = DESIGNATION_NAME_USE.get(designationType);
+    return sysCode != null ? new Coding(sysCode[0], sysCode[1]) : new Coding(designationType);
+  }
+
+  /** The full {@code system#code} URI for a designation use, or null when it has no system. */
+  private static String designationUseUri(Coding use) {
+    return use != null && use.getSystem() != null && use.getCode() != null ? use.getSystem() + "#" + use.getCode() : null;
+  }
   private static final String PROPERTY_VALUE_SET_EXTENSION_URL = "http://hl7.org/fhir/StructureDefinition/codesystem-property-valueset";
   private static final String PROPERTY_CODE_SYSTEM_EXTENSION_URL = "https://termx.org/fhir/StructureDefinition/codesystem-property-codesystem";
 
@@ -87,6 +140,9 @@ public class CodeSystemFhirMapper extends BaseFhirMapper {
       fhirCodeSystem.addExtension(toFhirWebSourceExtension(codeSystem.getExternalWebSource()));
     }
     fhirCodeSystem.setId(toFhirId(codeSystem, version));
+    if (CollectionUtils.isNotEmpty(codeSystem.getProfile())) {
+      fhirCodeSystem.setMeta(new com.kodality.zmei.fhir.resource.Meta().setProfile(codeSystem.getProfile()));
+    }
     fhirCodeSystem.setUrl(codeSystem.getUri());
     fhirCodeSystem.setPublisher(
         conceptService.load("publisher", codeSystem.getPublisher()).flatMap(Concept::getLastVersion).flatMap(CodeSystemEntityVersion::getDisplay)
@@ -260,13 +316,29 @@ public class CodeSystemFhirMapper extends BaseFhirMapper {
     if (CollectionUtils.isEmpty(designations)) {
       return null;
     }
-    return designations.stream().map(d -> new CodeSystemConceptDesignation()
-            .setLanguage(d.getLanguage())
-            .setValue(d.getName())
-            .setUse(new Coding(d.getDesignationType())))
+    return designations.stream().map(d -> {
+          CodeSystemConceptDesignation fd = new CodeSystemConceptDesignation()
+              .setLanguage(d.getLanguage())
+              .setValue(d.getName())
+              .setUse(designationUseCoding(d.getDesignationType()));
+          List<Extension> ext = toFhirDesignationExtensions(d.getExtension());
+          if (ext != null) {
+            fd.setExtension(ext);
+          }
+          return fd;
+        })
         .sorted(Comparator.comparing(d -> d.getLanguage() == null ? "" : d.getLanguage()))
         .sorted(Comparator.comparing(d -> d.getUse().getCode()))
         .toList();
+  }
+
+  /** Deserializes a stored designation extension (a raw FHIR-extension JSONB passthrough) back into FHIR Extensions. */
+  public static List<Extension> toFhirDesignationExtensions(Object extension) {
+    if (extension == null) {
+      return null;
+    }
+    List<Extension> exts = JsonUtil.fromJson(JsonUtil.toJson(extension), new com.fasterxml.jackson.core.type.TypeReference<List<Extension>>() {});
+    return CollectionUtils.isEmpty(exts) ? null : exts;
   }
 
   private List<CodeSystemProperty> toFhirCodeSystemProperty(List<EntityProperty> entityProperties, String lang) {
@@ -494,11 +566,20 @@ public class CodeSystemFhirMapper extends BaseFhirMapper {
 
   public CodeSystem fromFhirCodeSystem(com.kodality.zmei.fhir.resource.terminology.CodeSystem fhirCS) {
     CodeSystem codeSystem = new CodeSystem();
-    codeSystem.setId(CodeSystemFhirMapper.parseCompositeId(fhirCS.getId())[0]);
+    codeSystem.setId(CodeSystemFhirMapper.fhirIdOrFromUrl(fhirCS.getId(), fhirCS.getUrl()));
+    if (fhirCS.getMeta() != null && CollectionUtils.isNotEmpty(fhirCS.getMeta().getProfile())) {
+      codeSystem.setProfile(fhirCS.getMeta().getProfile());
+    }
     codeSystem.setUri(fhirCS.getUrl());
     codeSystem.setPublisher(fhirCS.getPublisher());
-    codeSystem.setName(fhirCS.getName());
-    codeSystem.setTitle(fromFhirName(fhirCS.getTitle(), fhirCS.getLanguage(), fhirCS.getPrimitiveElement("title")));
+    // FHIR name and title are optional, but TermX stores title NOT NULL. Fall back title -> name -> id;
+    // id itself already derives from the url's last segment when absent (see fhirIdOrFromUrl above), so a
+    // resource carrying only a url still loads instead of hitting the not-null constraint.
+    String name = StringUtils.isNotEmpty(fhirCS.getName()) ? fhirCS.getName() : codeSystem.getId();
+    codeSystem.setName(name);
+    codeSystem.setTitle(fromFhirName(
+        StringUtils.isNotEmpty(fhirCS.getTitle()) ? fhirCS.getTitle() : name,
+        fhirCS.getLanguage(), fhirCS.getPrimitiveElement("title")));
     codeSystem.setDescription(fromFhirName(fhirCS.getDescription(), fhirCS.getLanguage(), fhirCS.getPrimitiveElement("description")));
     codeSystem.setPurpose(fromFhirName(fhirCS.getPurpose(), fhirCS.getLanguage(), fhirCS.getPrimitiveElement("purpose")));
     codeSystem.setNarrative(fhirCS.getText() == null ? null : fhirCS.getText().getDiv());
@@ -543,7 +624,9 @@ public class CodeSystemFhirMapper extends BaseFhirMapper {
 
   private static List<CodeSystemVersion> fromFhirVersion(com.kodality.zmei.fhir.resource.terminology.CodeSystem fhirCodeSystem) {
     CodeSystemVersion version = new CodeSystemVersion();
-    version.setCodeSystem(fhirCodeSystem.getId());
+    // Use the same id the code system resolves to (derived from the url's last segment when the resource
+    // carries no explicit id) — otherwise the version's code_system FK is null for id-less fixtures.
+    version.setCodeSystem(fhirIdOrFromUrl(fhirCodeSystem.getId(), fhirCodeSystem.getUrl()));
     version.setVersion(fhirCodeSystem.getVersion() == null ? "1.0.0" : fhirCodeSystem.getVersion());
     version.setPreferredLanguage(fhirCodeSystem.getLanguage() == null ? Language.en : fhirCodeSystem.getLanguage());
     var supportedLanguages = Optional.ofNullable(fhirCodeSystem.getConcept()).map(List::stream).orElse(Stream.of())
@@ -587,7 +670,7 @@ public class CodeSystemFhirMapper extends BaseFhirMapper {
       properties.addAll(fhirCodeSystem.getConcept().stream()
           .filter(c -> c.getDesignation() != null)
           .flatMap(c -> c.getDesignation().stream())
-          .filter(d -> d.getUse() != null && d.getUse().getCode() != null && properties.stream().noneMatch(ep -> ep.getName().equals(d.getUse().getCode())))
+          .filter(d -> d.getUse() != null && d.getUse().getCode() != null && properties.stream().noneMatch(ep -> ep.getName().equals(designationUseName(d.getUse()))))
           .map(CodeSystemFhirMapper::fromFhirProperty).toList());
     }
     return properties.stream().collect(Collectors.toMap(EntityProperty::getName, p -> p, (p, q) -> p)).values().stream().toList();
@@ -610,7 +693,8 @@ public class CodeSystemFhirMapper extends BaseFhirMapper {
 
   private static EntityProperty fromFhirProperty(CodeSystemConceptDesignation d) {
     EntityProperty ep = new EntityProperty();
-    ep.setName(d.getUse().getCode());
+    ep.setName(designationUseName(d.getUse()));
+    ep.setUri(designationUseUri(d.getUse()));
     ep.setType(EntityPropertyType.string);
     ep.setKind(EntityPropertyKind.designation);
     ep.setStatus(PublicationStatus.active);
@@ -681,7 +765,7 @@ public class CodeSystemFhirMapper extends BaseFhirMapper {
     fhirConcepts.forEach(c -> {
       Concept concept = new Concept();
       concept.setCode(c.getCode());
-      concept.setCodeSystem(fhirCodeSystem.getId());
+      concept.setCodeSystem(fhirIdOrFromUrl(fhirCodeSystem.getId(), fhirCodeSystem.getUrl()));
       concept.setVersions(fromFhirConcepts(c, fhirCodeSystem, parent, parentMap));
       concepts.add(concept);
       if (c.getConcept() != null) {
@@ -696,7 +780,7 @@ public class CodeSystemFhirMapper extends BaseFhirMapper {
                                                                 CodeSystemConcept parent, Map<String, List<String>> parentMap) {
     CodeSystemEntityVersion version = new CodeSystemEntityVersion();
     version.setCode(c.getCode());
-    version.setCodeSystem(codeSystem.getId());
+    version.setCodeSystem(fhirIdOrFromUrl(codeSystem.getId(), codeSystem.getUrl()));
     version.setDesignations(fromFhirDesignations(c, codeSystem));
     version.setPropertyValues(fromFhirProperties(c.getProperty(), c.getCode()));
     version.setAssociations(fromFhirAssociations(parent, parentMap.get(c.getCode()), codeSystem));
@@ -721,14 +805,32 @@ public class CodeSystemFhirMapper extends BaseFhirMapper {
     if (c.getDesignation() == null) {
       c.setDesignation(new ArrayList<>());
     }
+    // A FHIR designation with no `use` is NOT a display (FHIR: use is optional, absence ≠ display). It becomes an
+    // `alternate` designation so it does not compete with the concept's real display — EXCEPT when the concept has
+    // no display of its own, where the FIRST use-less designation becomes the display (so the concept still has a
+    // display name). A designation WITH a use keeps its resolved type.
+    boolean[] displayTaken = {StringUtils.isNotEmpty(c.getDisplay())};
     List<Designation> designations = c.getDesignation().stream().map(d -> {
       Designation designation = new Designation();
-      designation.setDesignationType(d.getUse() == null ? DISPLAY : d.getUse().getCode());
+      if (d.getUse() != null && d.getUse().getCode() != null) {
+        designation.setDesignationType(designationUseName(d.getUse()));
+      } else if (!displayTaken[0]) {
+        designation.setDesignationType(DISPLAY);
+        designation.setPreferred(true);
+        displayTaken[0] = true;
+      } else {
+        designation.setDesignationType(ALTERNATE);
+      }
       designation.setName(d.getValue());
       designation.setLanguage(d.getLanguage() == null ? Language.en : d.getLanguage());
       designation.setCaseSignificance(caseSignificance);
       designation.setDesignationKind("text");
       designation.setStatus("active");
+      // Preserve any FHIR designation.extension (e.g. coding-sctdescid) as a verbatim JSONB passthrough so it
+      // round-trips on $expand/$lookup/CS export — termx assigns no semantics to these.
+      if (CollectionUtils.isNotEmpty(d.getExtension())) {
+        designation.setExtension(d.getExtension());
+      }
       return designation;
     }).collect(Collectors.toCollection(ArrayList::new));
 
@@ -740,6 +842,17 @@ public class CodeSystemFhirMapper extends BaseFhirMapper {
     display.setCaseSignificance(caseSignificance);
     display.setDesignationKind("text");
     display.setStatus("active");
+    // SNOMED CT concepts carry their label only as designations (no concept.display). For a SNOMED-URL code
+    // system, derive the display from the SNOMED designations — preferred term, else FSN, else synonym.
+    if (display.getName() == null && SNOMED_URL.equals(codeSystem.getUrl())) {
+      SNOMED_DISPLAY_PRIORITY.stream()
+          .flatMap(type -> designations.stream().filter(d -> type.equals(d.getDesignationType()) && d.getName() != null))
+          .findFirst()
+          .ifPresent(src -> {
+            display.setName(src.getName());
+            display.setLanguage(src.getLanguage());
+          });
+    }
     if (display.getName() != null && designations.stream().noneMatch(d -> isSameDesignation(d, display))) {
       designations.add(display);
     }
@@ -812,7 +925,7 @@ public class CodeSystemFhirMapper extends BaseFhirMapper {
       association.setAssociationType(codeSystem.getHierarchyMeaning() == null ? "is-a" : codeSystem.getHierarchyMeaning());
       association.setStatus(PublicationStatus.active);
       association.setTargetCode(parent.getCode());
-      association.setCodeSystem(codeSystem.getId());
+      association.setCodeSystem(fhirIdOrFromUrl(codeSystem.getId(), codeSystem.getUrl()));
       associations.add(association);
     }
     if (CollectionUtils.isNotEmpty(parents)) {
@@ -821,7 +934,7 @@ public class CodeSystemFhirMapper extends BaseFhirMapper {
         association.setAssociationType(codeSystem.getHierarchyMeaning() == null ? "is-a" : codeSystem.getHierarchyMeaning());
         association.setStatus(PublicationStatus.active);
         association.setTargetCode(p);
-        association.setCodeSystem(codeSystem.getId());
+        association.setCodeSystem(fhirIdOrFromUrl(codeSystem.getId(), codeSystem.getUrl()));
         return association;
       }).toList());
     }

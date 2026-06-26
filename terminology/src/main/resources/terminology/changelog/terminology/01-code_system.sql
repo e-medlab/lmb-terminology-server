@@ -158,3 +158,19 @@ add column external_web_source text;
 --rollback  drop column if exists external_web_source,
 --rollback  add column external_web_source boolean;
 --
+
+--changeset termx:code_system-profile
+-- FHIR meta.profile: conformance profiles the resource claims (0..*). Default empty (no profile).
+alter table terminology.code_system add column profile text[];
+--rollback alter table terminology.code_system drop column profile;
+--
+
+--changeset termx:loinc-external-codesystem-stub
+-- A content=not-present stub for http://loinc.org so $lookup/$validate-code can resolve the system to a
+-- CodeSystem id and delegate to the external LOINC server (LoincCodeSystemProvider). Seeded only when no
+-- LOINC CodeSystem already exists, so installs that imported LOINC are never touched.
+insert into terminology.code_system(id, uri, title, content, case_sensitive, sys_status, sys_version, sys_created_at, sys_created_by, sys_modified_at, sys_modified_by)
+select 'loinc', 'http://loinc.org', '{"en":"LOINC"}'::jsonb, 'not-present', 'ci', 'A', 1, now(), 'system', now(), 'system'
+where not exists (select 1 from terminology.code_system where uri = 'http://loinc.org' and sys_status = 'A');
+--rollback delete from terminology.code_system where id = 'loinc' and content = 'not-present';
+--

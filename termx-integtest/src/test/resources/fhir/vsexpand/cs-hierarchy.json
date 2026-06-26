@@ -1,0 +1,36 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "vsexpand-filter-cs",
+  "url": "http://termx-test.local/CodeSystem/vsexpand-filter-cs",
+  "version": "1.0.0",
+  "name": "VsExpandFilterCs",
+  "title": "Filter operator expansion test code system",
+  "status": "active",
+  "experimental": false,
+  "content": "complete",
+  "caseSensitive": true,
+  "hierarchyMeaning": "is-a",
+  "property": [
+    {"code": "method", "type": "string"},
+    {"code": "coded", "type": "Coding"}
+  ],
+  "concept": [
+    {
+      "code": "A",
+      "display": "Alpha",
+      "property": [{"code": "method", "valueString": "CHROM"}, {"code": "coded", "valueCoding": {"code": "cd-a"}}],
+      "concept": [
+        {
+          "code": "B",
+          "display": "Bravo",
+          "property": [{"code": "method", "valueString": "CHROM"}, {"code": "coded", "valueCoding": {"code": "cd-b"}}],
+          "concept": [
+            {"code": "D", "display": "Delta"}
+          ]
+        },
+        {"code": "C", "display": "Charlie"}
+      ]
+    },
+    {"code": "X", "display": "Xray"}
+  ]
+}

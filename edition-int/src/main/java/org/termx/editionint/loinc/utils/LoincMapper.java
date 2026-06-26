@@ -15,12 +15,15 @@ import org.termx.ts.codesystem.CodeSystemImportRequest.CodeSystemImportRequestVe
 import org.termx.ts.codesystem.Concept;
 import org.termx.ts.codesystem.Designation;
 import org.termx.ts.codesystem.EntityPropertyKind;
+import org.termx.ts.codesystem.EntityPropertyRule;
 import org.termx.ts.codesystem.EntityPropertyType;
 import org.termx.ts.codesystem.EntityPropertyValue;
 import java.time.LocalDate;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 public class LoincMapper {
@@ -31,28 +34,45 @@ public class LoincMapper {
   public static CodeSystemImportRequest toRequest(LoincImportRequest configuration, List<LoincConcept> concepts) {
     CodeSystemImportRequest request = new CodeSystemImportRequest();
     request.setActivate(false);
-    request.setCodeSystem(toCodeSystem());
-    request.setVersion(toVersion(configuration.getVersion()));
+    List<String> supportedLanguages = supportedLanguages(concepts);
+    request.setCodeSystem(toCodeSystem(supportedLanguages));
+    request.setVersion(toVersion(configuration.getVersion(), supportedLanguages));
 
     request.setProperties(toProperties(concepts));
     request.setConcepts(toConcepts(concepts));
     return request;
   }
 
-  private static CodeSystemImportRequestCodeSystem toCodeSystem() {
+  /**
+   * Languages actually present in the imported concepts (display map keys), English first. Linguistic
+   * variant imports add their language (e.g. "cs") to the concept displays via
+   * {@code LoincService.processLinguisticVariants}; declaring them here means the code system / version
+   * advertise the translation language instead of only "en". Issue #48.
+   */
+  private static List<String> supportedLanguages(List<LoincConcept> concepts) {
+    LinkedHashSet<String> languages = new LinkedHashSet<>();
+    languages.add(Language.en);
+    concepts.stream().filter(c -> c.getDisplay() != null)
+        .flatMap(c -> c.getDisplay().keySet().stream())
+        .filter(Objects::nonNull)
+        .forEach(languages::add);
+    return new ArrayList<>(languages);
+  }
+
+  private static CodeSystemImportRequestCodeSystem toCodeSystem(List<String> supportedLanguages) {
     return new CodeSystemImportRequestCodeSystem().setId("loinc")
         .setUri("http://loinc.org")
         .setPublisher("Regenstrief Institute, Inc.")
         .setTitle(new LocalizedName(Map.of("en", "LOINC")))
         .setContent(CodeSystemContent.complete)
         .setCaseSensitive(CaseSignificance.entire_term_case_insensitive)
-        .setSupportedLanguages(List.of(Language.en));
+        .setSupportedLanguages(supportedLanguages);
   }
 
-  private static CodeSystemImportRequestVersion toVersion(String version) {
+  private static CodeSystemImportRequestVersion toVersion(String version, List<String> supportedLanguages) {
     return new CodeSystemImportRequestVersion()
         .setVersion(version)
-        .setSupportedLanguages(List.of(Language.en))
+        .setSupportedLanguages(supportedLanguages)
         .setReleaseDate(LocalDate.now());
   }
 
@@ -63,9 +83,27 @@ public class LoincMapper {
     // INSERT bug in CodeSystemEntityRepository.batchUpsert was fixed and the import reached
     // the LOINC concept code-system import for the first time.
     List<CodeSystemImportRequestProperty> properties = concepts.stream()
-        .flatMap(c -> c.getProperties().stream()).collect(Collectors.toSet()).stream()
-        .collect(Collectors.toMap(LoincConceptProperty::getName, p -> p, (p, q) -> p)).values().stream()
-        .map(property -> new CodeSystemImportRequestProperty().setName(property.getName()).setType(property.getType()).setKind(EntityPropertyKind.property))
+        .flatMap(c -> c.getProperties().stream())
+        .collect(Collectors.groupingBy(LoincConceptProperty::getName)).entrySet().stream()
+        .map(e -> {
+          LoincConceptProperty sample = e.getValue().get(0);
+          CodeSystemImportRequestProperty property = new CodeSystemImportRequestProperty()
+              .setName(e.getKey()).setType(sample.getType()).setKind(EntityPropertyKind.property);
+          // Coding-typed property values (e.g. answer-list) reference an external code system.
+          // Record those systems on the property definition so they survive import and the FHIR
+          // export can emit codesystem-property-codesystem. Issue #48.
+          if (EntityPropertyType.coding.equals(sample.getType())) {
+            List<String> codeSystems = e.getValue().stream()
+                .map(LoincConceptProperty::getValue)
+                .filter(Concept.class::isInstance).map(Concept.class::cast)
+                .map(Concept::getCodeSystem).filter(Objects::nonNull)
+                .distinct().toList();
+            if (!codeSystems.isEmpty()) {
+              property.setRule(new EntityPropertyRule().setCodeSystems(codeSystems));
+            }
+          }
+          return property;
+        })
         .collect(Collectors.toCollection(ArrayList::new));
     properties.add(new CodeSystemImportRequestProperty().setName(DISPLAY).setType(EntityPropertyType.string).setKind(EntityPropertyKind.designation));
     properties.add(new CodeSystemImportRequestProperty().setName(KEY_WORDS).setType(EntityPropertyType.string).setKind(EntityPropertyKind.property));

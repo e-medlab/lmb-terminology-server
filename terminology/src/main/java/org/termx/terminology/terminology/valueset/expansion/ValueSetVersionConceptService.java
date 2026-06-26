@@ -53,6 +53,7 @@ public class ValueSetVersionConceptService {
 
   private static final String DEPRECATION_DATE = "deprecationDate";
   private static final String INACTIVE = "inactive";
+  private static final String NOT_SELECTABLE = "notSelectable";
   private static final String STATUS = "status";
   private static final String RETIREMENT_DATE = "retirementDate";
   private static final String SNOMED_URI = "http://snomed.info/sct";
@@ -156,6 +157,7 @@ public class ValueSetVersionConceptService {
     CodeSystemEntityVersionQueryParams params = new CodeSystemEntityVersionQueryParams();
     params.setIds(String.join(",", versionIds));
     params.limit(versionIds.size());
+    params.setDecorateBaseCodeSystem(false); // language render path — don't fan out to base code systems. Issue #36.
     Map<Long, Designation> result = new HashMap<>();
     for (CodeSystemEntityVersion v : codeSystemEntityVersionService.query(params).getData()) {
       if (v.getId() == null || v.getDesignations() == null) {
@@ -163,7 +165,7 @@ public class ValueSetVersionConceptService {
       }
       v.getDesignations().stream()
           .filter(d -> "display".equals(d.getDesignationType()) && !PublicationStatus.retired.equals(d.getStatus()))
-          .filter(d -> d.getLanguage() != null && (d.getLanguage().equals(language) || d.getLanguage().startsWith(language)))
+          .filter(d -> d.getLanguage() != null && language != null && (d.getLanguage().equals(language) || d.getLanguage().startsWith(language)))
           .min(Comparator.comparing(Designation::isPreferred).reversed())
           .ifPresent(d -> result.putIfAbsent(v.getId(), d));
     }
@@ -180,6 +182,7 @@ public class ValueSetVersionConceptService {
         .setOrderNumber(c.getOrderNumber())
         .setEnumerated(c.isEnumerated())
         .setActive(c.isActive())
+        .setNotSelectable(c.isNotSelectable())
         .setStatus(c.getStatus())
         .setAssociations(c.getAssociations())
         .setPropertyValues(c.getPropertyValues());
@@ -226,7 +229,12 @@ public class ValueSetVersionConceptService {
       externalExpansion.addAll(provider.expand(ruleSet, version, preferredLanguage));
     }
     expansion.addAll(externalExpansion);
-    if (!ruleSet.isInactive()) {
+    // FHIR compose.inactive (tri-state): only an explicit FALSE excludes inactive concepts from the
+    // expansion. When null (server default) or TRUE, inactive concepts stay in the request-agnostic
+    // snapshot — rendered with inactive=true and filtered only at render time by activeOnly
+    // (see ValueSetFhirMapper.toFhirExpansion). Previously a primitive-false default dropped them here,
+    // hiding inactive codes from every consumer ($expand, $validate-code, ConceptMap, CS validation).
+    if (Boolean.FALSE.equals(ruleSet.getInactive())) {
       return expansion.stream().filter(ValueSetVersionConcept::isActive).toList();
     }
     return expansion;
@@ -253,6 +261,9 @@ public class ValueSetVersionConceptService {
     CodeSystemEntityVersionQueryParams params = new CodeSystemEntityVersionQueryParams();
     params.setIds(String.join(",", versionIds));
     params.limit(versionIds.size());
+    // Don't pull every dependent (base) code system's designations/properties per concept — that is
+    // what blows large expansions up to gigabytes. Issue #36.
+    params.setDecorateBaseCodeSystem(false);
     List<CodeSystemEntityVersion> entityVersions = codeSystemEntityVersionService.query(params).getData();
     Map<String, List<CodeSystemEntityVersion>> groupedVersions = entityVersions.stream().collect(Collectors.groupingBy(v -> v.getCodeSystem() + v.getCode()));
 
@@ -268,7 +279,14 @@ public class ValueSetVersionConceptService {
           List<String> csVersions = versions.stream().flatMap(v -> Optional.ofNullable(v.getVersions()).orElse(List.of()).stream().map(CodeSystemVersionReference::getVersion)).toList();
           c.getConcept().setCodeSystemVersions(csVersions);
 
-          List<Designation> designations = versions.stream()
+          // When a code exists as separate entity versions across several code system versions
+          // (e.g. LOINC 2.80 and 2.81), a value set rule bound to one version must only surface that
+          // version's designations. The expand never returns code system versions newer than the bound
+          // one, so the most recent entity version present here is the bound (or the newest still valid
+          // as of the bound) version. Collecting designations from every returned version leaked the
+          // other versions' designations. Issue #49.
+          List<CodeSystemEntityVersion> designationVersions = latestCodeSystemVersion(versions);
+          List<Designation> designations = designationVersions.stream()
               .filter(v -> CollectionUtils.isNotEmpty(v.getDesignations()))
               .flatMap(v -> v.getDesignations().stream())
               .filter(d -> !PublicationStatus.retired.equals(d.getStatus())).toList();
@@ -283,6 +301,7 @@ public class ValueSetVersionConceptService {
                 .filter(d -> !d.isSupplement() || designations.stream().noneMatch(d1 -> d1.getDesignationType().equals(d.getDesignationType()) && d1 != d)).toList());
           }
           c.setActive(calculatedActive(versions));
+          c.setNotSelectable(calculatedNotSelectable(versions));
           c.setStatus(versions.stream().findFirst().map(CodeSystemEntityVersion::getStatus).orElse(PublicationStatus.active));
           c.setAssociations(versions.stream().filter(v -> CollectionUtils.isNotEmpty(v.getAssociations()))
               .flatMap(v -> v.getAssociations().stream()).toList());
@@ -329,6 +348,31 @@ public class ValueSetVersionConceptService {
     return res;
   }
 
+  /**
+   * Keep only the entity versions that belong to the most recent code system version among
+   * {@code versions} (by release date; an unreleased/null release date counts as newest, matching the
+   * expand SQL's {@code release_date desc nulls first} ordering). Used to scope designations to the
+   * version a value set rule is bound to. See issue #49.
+   */
+  static List<CodeSystemEntityVersion> latestCodeSystemVersion(List<CodeSystemEntityVersion> versions) {
+    if (versions == null || versions.size() <= 1) {
+      return versions == null ? List.of() : versions;
+    }
+    return versions.stream()
+        .max(Comparator.comparing(ValueSetVersionConceptService::maxReleaseDate))
+        .map(ValueSetVersionConceptService::maxReleaseDate)
+        .map(top -> versions.stream().filter(v -> top.equals(maxReleaseDate(v))).toList())
+        .orElse(versions);
+  }
+
+  private static java.time.LocalDate maxReleaseDate(CodeSystemEntityVersion version) {
+    return Optional.ofNullable(version.getVersions()).orElse(List.of()).stream()
+        .map(CodeSystemVersionReference::getReleaseDate)
+        .map(d -> d == null ? java.time.LocalDate.MAX : d)
+        .max(Comparator.naturalOrder())
+        .orElse(java.time.LocalDate.MIN);
+  }
+
   private boolean calculatedActive(List<CodeSystemEntityVersion> versions) {
     boolean inactive = versions.stream().anyMatch(v -> v.getPropertyValues() != null &&
         v.getPropertyValues().stream()
@@ -340,6 +384,15 @@ public class ValueSetVersionConceptService {
     boolean deprecated = dateIsAfter(versions, DEPRECATION_DATE);
     boolean noActiveVersion = CollectionUtils.isNotEmpty(versions) && versions.stream().noneMatch(v -> PublicationStatus.active.equals(v.getStatus()));
     return !noActiveVersion && !status && !inactive && !retired && !deprecated;
+  }
+
+  /** A concept is abstract (FHIR expansion.contains.abstract) when its {@code notSelectable} boolean
+   *  property is true on any of its entity versions — it groups codes but is not itself a valid member. */
+  private boolean calculatedNotSelectable(List<CodeSystemEntityVersion> versions) {
+    return versions.stream().anyMatch(v -> v.getPropertyValues() != null &&
+        v.getPropertyValues().stream().anyMatch(pv -> pv.getEntityProperty().equals(NOT_SELECTABLE)
+            && EntityPropertyType.bool.equals(pv.getEntityPropertyType())
+            && pv.getValue() != null && Boolean.parseBoolean(String.valueOf(pv.getValue()))));
   }
 
   private boolean dateIsAfter(List<CodeSystemEntityVersion> versions, String prop) {

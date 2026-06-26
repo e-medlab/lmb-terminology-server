@@ -53,6 +53,7 @@ public class ValueSetImportService {
 
   @Transactional
   public ValueSet importValueSet(ValueSet valueSet, ValueSetImportAction action) {
+    reconcileCanonicalId(valueSet);
     SessionStore.require().checkPermitted(valueSet.getId(), Privilege.VS_WRITE);
 
     long start = System.currentTimeMillis();
@@ -74,6 +75,45 @@ public class ValueSetImportService {
     }
     log.info("IMPORT FINISHED (" + (System.currentTimeMillis() - start) / 1000 + " sec)");
     return valueSet;
+  }
+
+  /**
+   * Folds an incoming value set into an existing canonical: a FHIR resource's identity is its {@code url},
+   * but the tx-ecosystem ships multiple versions of one canonical as SEPARATE resources sharing a url with
+   * distinct ids. TermX keys on id and has a unique index on uri, so without this the second such resource
+   * collides on {@code value_set_ukey}. When a value set with the same uri already exists under a different
+   * id, adopt that id so the import becomes a NEW VERSION of the existing canonical.
+   */
+  private void reconcileCanonicalId(ValueSet valueSet) {
+    if (StringUtils.isEmpty(valueSet.getUri())) {
+      return;
+    }
+    // (1) Same canonical (url) already stored under a different id — adopt it (a new version of it).
+    String byUri = valueSetService.query(new org.termx.ts.valueset.ValueSetQueryParams().setUri(valueSet.getUri()).limit(1)).findFirst()
+        .map(ValueSet::getId)
+        .filter(existingId -> !existingId.equals(valueSet.getId()))
+        .orElse(null);
+    if (byUri != null) {
+      rekey(valueSet, byUri, "Reconciling value set to existing canonical id");
+      return;
+    }
+    // (2) Our id is already taken by a value set with a DIFFERENT url. The url is the canonical identity, not
+    // the FHIR resource id (the tx-ecosystem reuses id "sct-procedures" across several urls). Re-key off our
+    // own url so this distinct canonical doesn't fold into the other one.
+    ValueSet clash = StringUtils.isEmpty(valueSet.getId()) ? null : valueSetService.load(valueSet.getId());
+    if (clash != null && !valueSet.getUri().equals(clash.getUri())) {
+      String urlId = org.termx.core.fhir.BaseFhirMapper.fhirIdOrFromUrl(null, valueSet.getUri());
+      if (StringUtils.isNotEmpty(urlId) && !urlId.equals(valueSet.getId())) {
+        rekey(valueSet, urlId, "Re-keying value set off url (id collides with a different canonical)");
+      }
+    }
+  }
+
+  /** Re-points a value set and its nested versions at {@code newId}. */
+  private void rekey(ValueSet valueSet, String newId, String why) {
+    log.info("{}: '{}' -> '{}' (uri {})", why, valueSet.getId(), newId, valueSet.getUri());
+    valueSet.setId(newId);
+    Optional.ofNullable(valueSet.getVersions()).orElse(List.of()).forEach(v -> v.setValueSet(newId));
   }
 
   private void saveValueSet(ValueSet valueSet) {
