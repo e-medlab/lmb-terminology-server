@@ -8,6 +8,14 @@ ENV APP_VERSION=${APP_VERSION:-latest}
 ARG BUILD_TIME
 ENV BUILD_TIME=$BUILD_TIME
 
+# The entrypoint imports operator-provided CA certificates from /certs into the
+# JVM truststore before handing off to CMD. It MUST land at /entrypoint.sh —
+# the ENTRYPOINT directive below references it by absolute path, and a missing
+# file makes the container un-startable (runc fails during container init).
+# The CI smoke test in build.yml guards this invariant.
+ADD entrypoint.sh /
+RUN mkdir /certs
+
 # Short commit sha and the merged PR number, surfaced on /info so a running
 # container can be traced back to an exact build (version is just the image tag,
 # e.g. "latest", which isn't enough on dev).
@@ -15,8 +23,6 @@ ARG GIT_COMMIT
 ENV GIT_COMMIT=$GIT_COMMIT
 ARG PR_NUMBER
 ENV PR_NUMBER=$PR_NUMBER
-ADD entrypoint.sh /
-RUN mkdir /certs
 
 # Fail-fast on OutOfMemoryError instead of letting the JVM limp on with a depleted
 # heap. Without this, a single OOM cascades into every concurrent request, the

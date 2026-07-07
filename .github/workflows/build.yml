@@ -138,6 +138,28 @@ jobs:
           flavor: |
             latest=false
 
+      # Gate publication on the image actually being able to start. The 2026-07-06
+      # build shipped ENTRYPOINT ["/entrypoint.sh"] without the file (lost in an
+      # upstream rebase-sync), so every consumer of :latest got a container that
+      # died in runc before the JVM ran a single instruction. Build the amd64
+      # image into the local daemon and exec through the real entrypoint chain;
+      # a dangling ENTRYPOINT path fails here instead of on customer hosts.
+      - name: Build image for smoke test (amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./termx-app
+          platforms: linux/amd64
+          load: true
+          tags: smoke-test:local
+
+      - name: Smoke test entrypoint
+        working-directory: .
+        run: |
+          echo "=== Declared entrypoint file must exist and be executable ==="
+          docker run --rm --entrypoint /bin/sh smoke-test:local -c 'test -x /entrypoint.sh'
+          echo "=== Container init must reach CMD through the entrypoint ==="
+          docker run --rm smoke-test:local /bin/sh -c 'echo entrypoint-chain-ok'
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
