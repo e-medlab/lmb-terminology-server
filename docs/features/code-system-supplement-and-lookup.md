@@ -200,9 +200,10 @@ Content-Type: application/json
 
 ## 5. Implementation notes (TermX codebase)
 
-- **Lookup + supplements:** `CodeSystemLookupOperation` loads the concept from the base system, then calls `loadSupplementDesignations(...)` which:
+- **Lookup + supplements:** `CodeSystemLookupOperation` resolves the concept through the shared concept-query path — it builds a `ConceptQueryParams` with `setIncludeSupplement(true)`, `setDisplayLanguage(...)`, and `setUseSupplement(extractUseSupplement(req))` and calls `conceptService.query(...)` (`CodeSystemLookupOperation.java:125-133`). There is no dedicated `loadSupplementDesignations` method; supplement enrichment happens inside that query path (`ConceptSupplementService`), which:
   - collects supplement references from `useSupplement` parameters (valueCanonical/valueUri/valueUrl/valueString),
   - if `displayLanguage` is set, discovers supplements by `baseCodeSystem` + `content = supplement`,
   - for each supplement, loads the concept by the same `code` in the supplement and merges designations, filtered by `displayLanguage`.
 - **UCUM special case:** For `system = "http://unitsofmeasure.org"`, the server maps to the internal code system ID `ucum` when the URI does not match a stored CodeSystem by URI.
 - **Value set expansion:** Value set expansion can also include supplement designations for UCUM concepts when a preferred language is set, via `UcumSupplementDesignationService` (enriches `ValueSetVersionConcept` with `additionalDesignations` from UCUM supplements for the given language).
+- **Cancelling a supplement:** A supplement's entity versions carry `code_system = <supplement>` while their `code_system_entity` still belongs to the base code system. `terminology.cancel_code_system(p_code_system)` therefore matches those rows both through the `code_system_entity` link **and** directly by their `code_system` column (`... or code_system = p_code_system`), so cancelling a supplement soft-deletes its own `code_system_entity_version` rows, associations, property values and designations instead of leaving them orphaned (`sys_status = 'A'`).

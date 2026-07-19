@@ -15,9 +15,9 @@ This feature allows you to export your TermX terminology servers in the **FHIR T
 
 ### Export Servers
 
-**GET** `/api/terminology-servers/export/ecosystem`
+**GET** `/servers/export/ecosystem`
 
-**Authorization:** `TerminologyServer.read` privilege required
+**Authorization:** `Server.read` privilege required
 
 **Query Parameters:**
 - `download` (optional, boolean) - If `true`, returns response as downloadable file
@@ -31,20 +31,20 @@ This feature allows you to export your TermX terminology servers in the **FHIR T
 ### View Export in Browser
 
 ```bash
-curl http://localhost:8200/api/terminology-servers/export/ecosystem
+curl http://localhost:8200/servers/export/ecosystem
 ```
 
 ### Download as File
 
 ```bash
-curl "http://localhost:8200/api/terminology-servers/export/ecosystem?download=true" -o termx-servers.json
+curl "http://localhost:8200/servers/export/ecosystem?download=true" -o termx-servers.json
 ```
 
 ### Using in Scripts
 
 ```bash
 # Export and save
-EXPORT_URL="http://localhost:8200/api/terminology-servers/export/ecosystem?download=true"
+EXPORT_URL="http://localhost:8200/servers/export/ecosystem?download=true"
 curl "$EXPORT_URL" -o termx-ecosystem-registry.json
 
 # Verify the file
@@ -64,14 +64,16 @@ The export follows the FHIR Ecosystem server registry specification:
     "name": "Terminoloogiaserver",
     "url": "https://server.example.org",
     "open": true,
-    "fhirVersions": [{
-      "version": "R4",
-      "url": "https://server.example.org/fhir"
-    }],
     "authoritative": [],
     "authoritative-valuesets": [],
-    "candidate": [],
-    "exclusions": []
+    "authoritative-conceptmaps": [],
+    "authoritative-structuredefinitions": [],
+    "authoritative-structuremaps": [],
+    "exclusions": [],
+    "fhirVersions": [{
+      "version": "R5",
+      "url": "https://server.example.org"
+    }]
   }]
 }
 ```
@@ -87,9 +89,13 @@ The export follows the FHIR Ecosystem server registry specification:
   - `token: true` - If token authentication configured (Authorization header)
   - `oauth: true` - If OAuth authentication configured
 - `access_info` - Human-readable authentication information (when applicable)
-- `fhirVersions` - Array of FHIR versions supported (currently defaults to R4)
-- `authoritative` - Code systems where server is authoritative (currently empty, for future enhancement)
-- `authoritative-valuesets` - Value sets where server is authoritative (currently empty, for future enhancement)
+- `fhirVersions` - Array of FHIR versions supported (per-server; e.g. R3/R4/R4B/R5/R6)
+- `authoritative` - Code systems where the server is authoritative (resolved from the server's authoritative-resource patterns)
+- `authoritative-valuesets` - Value sets where the server is authoritative (resolved from the server's authoritative-resource patterns)
+
+> These fields are populated from the server's configured authoritative-resource patterns and
+> supported FHIR versions. See [`fhir-terminology-ecosystem-fields.md`](fhir-terminology-ecosystem-fields.md)
+> for the authoritative field-level reference.
 
 ### Filter Behavior
 
@@ -103,7 +109,7 @@ Export your servers and register them with the HL7 FHIR Terminology Ecosystem:
 
 ```bash
 # Export your servers
-curl "http://localhost:8200/api/terminology-servers/export/ecosystem?download=true" -o my-servers.json
+curl "http://localhost:8200/servers/export/ecosystem?download=true" -o my-servers.json
 
 # Host the file at a public URL
 # Then submit the URL to HL7 for inclusion in the master registry
@@ -115,7 +121,7 @@ Export and share your server list with partner organizations:
 
 ```bash
 # Export
-curl "http://localhost:8200/api/terminology-servers/export/ecosystem?download=true" -o servers.json
+curl "http://localhost:8200/servers/export/ecosystem?download=true" -o servers.json
 
 # Share the JSON file with partners
 # They can import it or use it for discovery
@@ -129,7 +135,7 @@ Create regular backups of your server configuration:
 # Automated backup script
 #!/bin/bash
 DATE=$(date +%Y%m%d)
-curl "http://localhost:8200/api/terminology-servers/export/ecosystem?download=true" \
+curl "http://localhost:8200/servers/export/ecosystem?download=true" \
   -o "backups/termx-servers-$DATE.json"
 ```
 
@@ -139,16 +145,19 @@ Generate documentation about available servers:
 
 ```bash
 # Export and format
-curl "http://localhost:8200/api/terminology-servers/export/ecosystem" | jq '.'
+curl "http://localhost:8200/servers/export/ecosystem" | jq '.'
 
 # Extract server names
-curl "http://localhost:8200/api/terminology-servers/export/ecosystem" | \
+curl "http://localhost:8200/servers/export/ecosystem" | \
   jq -r '.servers[] | .name'
 ```
 
-## Web UI Access (Future Enhancement)
+## Web UI Access
 
-In the admin interface at `http://localhost:4200/terminology-servers`, you can add an **Export** button that calls this endpoint and downloads the file.
+In the admin interface at `http://localhost:4200/terminology-servers`, the "..." menu on the
+server list page provides **Export to FHIR Ecosystem format** (and **Import from FHIR Ecosystem
+file**), which call these endpoints. See
+[`fhir-terminology-ecosystem-fields.md`](fhir-terminology-ecosystem-fields.md) for the UI reference.
 
 ## Technical Details
 
@@ -174,57 +183,34 @@ In the admin interface at `http://localhost:4200/terminology-servers`, you can a
 **Name Extraction:**
 - Prefers English name (`en`)
 - Falls back to first available language
-- Defaults to "Unknown Server" if no name
+- `name` is `null` (omitted) when the server has no name
 
 **FHIR Endpoint:**
-- Appends `/fhir` to root URL
-- Handles trailing slashes correctly
+- When `fhirVersions` is not configured, a single default entry is emitted with
+  `version: "R5"` and `url` set to the server's root URL verbatim (no `/fhir` is appended)
 
 ## Limitations
 
-### Current Version
+The following are **implemented** and no longer limitations:
 
-1. **FHIR Version:** Currently defaults to R4 only
-   - Future: Allow configuration of supported FHIR versions per server
+- **FHIR versions** are configurable per server (R3/R4/R4B/R5/R6), not fixed to R4.
+- **Authoritative code systems / value sets** are populated from each server's configured
+  authoritative-resource patterns, resolved against TermX's own resources.
 
-2. **Authoritative Systems:** Empty arrays for now
-   - Future: Populate from CodeSystem/ValueSet metadata
-   - Will need to track which systems each server is authoritative for
+Still open / possible future work:
 
-3. **Usage Tags:** Not implemented
-   - Future: Add usage categorization (publication, validation, code-generation)
-
-4. **Content Level:** Not specified for candidate servers
-   - Future: Add content level indicators (complete, fragment, etc.)
+1. **Usage Tags** — usage categorization (publication, validation, code-generation) is not yet emitted.
+2. **Content Level** — content-level indicators (complete, fragment, etc.) for candidate servers are
+   not yet specified.
 
 ## Future Enhancements
 
-### Phase 1: Enhanced Metadata
-
-Add fields to `TerminologyServer` model:
-```java
-private List<String> authoritativeCodeSystems;
-private List<String> authoritativeValueSets;
-private List<String> fhirVersions;
-private List<String> usageTags;
-```
-
-### Phase 2: Auto-Discovery
+### Auto-Discovery
 
 Automatically populate authoritative lists by:
 - Querying CodeSystem resources on the server
 - Querying ValueSet resources on the server
 - Extracting canonical URLs
-
-### Phase 3: Multi-Version Support
-
-Support multiple FHIR versions per server:
-```json
-"fhirVersions": [
-  {"version": "R4", "url": "https://server/r4"},
-  {"version": "R5", "url": "https://server/r5"}
-]
-```
 
 ## Security Considerations
 
@@ -234,7 +220,7 @@ Support multiple FHIR versions per server:
 - Only `access_info` text is included (no credentials)
 
 **Access Control:**
-- Requires `TerminologyServer.read` privilege
+- Requires `Server.read` privilege
 - Admin users have access by default
 - Configure additional users in `mock/users.json`
 
@@ -244,7 +230,7 @@ Support multiple FHIR versions per server:
 
 **Solution:** Check that you have active servers configured:
 ```bash
-curl http://localhost:8200/api/terminology-servers
+curl http://localhost:8200/servers
 ```
 
 ---
@@ -255,20 +241,20 @@ curl http://localhost:8200/api/terminology-servers
 ```yaml
 auth:
   mock:
-    default-user: admin  # Required for TerminologyServer.read
+    default-user: admin  # Required for Server.read
 ```
 
 ---
 
-**Issue:** Names show as "Unknown Server"
+**Issue:** Server `name` is `null` / missing in the export
 
 **Solution:** Add a name to your server in the TermX admin UI at `http://localhost:4200/terminology-servers`
 
 ## Related Documentation
 
 - [FHIR Terminology Ecosystem IG](https://build.fhir.org/ig/HL7/fhir-tx-ecosystem-ig/ecosystem.html)
-- [FHIR Terminology Ecosystem Integration](fhir-terminology-ecosystem-api.md) - Discovery and Resolution API
-- [Terminology Server Management](../README.md) - Managing internal servers
+- [FHIR Terminology Ecosystem Integration](fhir-terminology-ecosystem-registry-proxy.md) - Discovery and Resolution API
+- [Terminology Server Management](../../README.md) - Managing internal servers
 
 ## Example Output
 
@@ -282,16 +268,18 @@ auth:
       "name": "Terminoloogiaserver",
       "url": "https://server.example.org",
       "open": true,
-      "fhirVersions": [
-        {
-          "version": "R4",
-          "url": "https://server.example.org/fhir"
-        }
-      ],
       "authoritative": [],
       "authoritative-valuesets": [],
-      "candidate": [],
-      "exclusions": []
+      "authoritative-conceptmaps": [],
+      "authoritative-structuredefinitions": [],
+      "authoritative-structuremaps": [],
+      "exclusions": [],
+      "fhirVersions": [
+        {
+          "version": "R5",
+          "url": "https://server.example.org"
+        }
+      ]
     }
   ]
 }
@@ -305,4 +293,4 @@ auth:
 ✅ Secure (no credentials exported)  
 ✅ Ready for HL7 ecosystem registration  
 
-**Available Now:** `GET /api/terminology-servers/export/ecosystem`
+**Available Now:** `GET /servers/export/ecosystem`
