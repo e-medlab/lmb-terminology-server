@@ -1,10 +1,22 @@
-# TermX Server
+# Termx server app for Lithuania (LMB)
 
 A FHIR-compliant terminology server for managing and serving healthcare terminologies.
+
 
 ## Versioning
 
 The application version is defined in the `VERSION` file in the project root; it is read by `build.gradle.kts` at build time and overrides `gradle.properties`.
+
+## Branch Image Tag
+
+This repository is a fork of `termx-server`.
+
+
+## Docker Image
+
+Use the Docker image:
+```ghcr.io/e-medlab/lmb-termx-server:latest```
+
 
 ## Features
 
@@ -36,20 +48,20 @@ Discover and resolve terminology servers across distributed healthcare systems.
 
 For complete feature documentation, see the [docs/features](docs/features) directory.
 
-## Init postgres docker 
+## Init postgres docker
 Or you can also use an existing database.
 
 Pull postgres public image.
-```bash 
-docker pull postgres:18
+```bash
+docker pull postgres:14
 ```  
 Run Docker container
-```bash 
-docker run -d --restart=unless-stopped --name tx-pg -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres:18
-``` 
+```bash
+docker run -d --restart=unless-stopped --name termx-postgres -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres:14
+```
 Connect and create database\users using the following command
-```bash 
-docker exec -i tx-pg psql -U postgres <<-EOSQL
+```bash
+docker exec -i termx-postgres psql -U postgres <<-EOSQL
 CREATE ROLE tx_admin LOGIN PASSWORD 'test' NOSUPERUSER INHERIT NOCREATEDB CREATEROLE NOREPLICATION;
 CREATE ROLE tx_app   LOGIN PASSWORD 'test' NOSUPERUSER INHERIT NOCREATEDB CREATEROLE NOREPLICATION;
 CREATE ROLE tx_viewer NOLOGIN NOSUPERUSER INHERIT NOCREATEDB NOCREATEROLE NOREPLICATION;
@@ -61,8 +73,8 @@ EOSQL
 ```
 
 If you need to create a separate db for testing:
-```bash 
-docker exec -i tx-pg psql -U postgres <<-EOSQL
+```bash
+docker exec -i termx-postgres psql -U postgres <<-EOSQL
 CREATE DATABASE termx_new WITH OWNER = tx_admin ENCODING = 'UTF8' TABLESPACE = pg_default CONNECTION LIMIT = -1;
 grant temp on database termx_new to tx_app;
 grant connect on database termx_new to tx_app;
@@ -78,11 +90,11 @@ To target a different database name:
 ```
 In case you are using an existing database, run SQL commands between EOSQL via sql console.
 
-## Navigate to app folder and run application in the development mode 
-```bash 
+## Navigate to app folder and run application in the development mode
+```bash
 cd termx-app
 ./gradlew run -Pdev
-``` 
+```
 In the development mode you can use application without authentication. The application use special dev token **Bearer token** `yupi` in request Authorization header.
 
 ### Yupi privilege override (QA / migration testing)
@@ -118,6 +130,13 @@ Authorization: Bearer yupi{"username":"qa","privileges":["*.CodeSystem.read"]}
 
 - **Local (verbose)**: Copy [`termx-app/src/main/resources/application-local.sample.yml`](termx-app/src/main/resources/application-local.sample.yml) to `termx-app/src/main/resources/application-local.yml` (that file is gitignored). The sample contains commented-out sections for every common dev override — logger levels, Bob/Minio, dev auth (yupi privileges), Snowstorm, SMTP, Postgres, SQL trace. Uncomment what you need. Micronaut only loads `application-local.yml` when the **`local`** environment is active. Use **`./gradlew :termx-app:run -Pdev`** or **`./scripts/run-backend.sh`** (they set `dev,local`), or add **`-Dmicronaut.environments=dev,local`** to the JVM when running from the IDE. **`./gradlew run` without `-Pdev` does not load `application-local.yml`**, so `logger.levels` there will have no effect.
 - **Docker**: Default root level is **INFO** unless overridden. Set **`LOGBACK_LOG_LEVEL`** (e.g. `DEBUG` for troubleshooting) or pass **`-DLOGBACK_LOG_LEVEL=...`** via **`JAVA_OPTS`**. For Docker Compose, add a line in [`deployment/docker-compose/server.env`](deployment/docker-compose/server.env).
+- **TermxUserProvider debug logs**: The logger for `org.termx.user.TermxUserProvider` is controlled via **`TERMX_USER_PROVIDER_LOG_LEVEL`** and defaults to **`DEBUG`**. This is useful when troubleshooting `/api/users` and the upstream `nsoft` `/info/users` call in containers. Example:
+
+```bash
+TERMX_USER_PROVIDER_LOG_LEVEL=DEBUG
+```
+
+Set it to `INFO`, `WARN`, or `ERROR` to reduce verbosity.
 
 ### Running automated tests
 
@@ -145,17 +164,17 @@ It should return CapabilityStatement resource.
 ## Authentication
 
 ### Keyclock
-The terminology server requires authenticated users. Any authentication server supporting Open-Id connect should suffice. For our development, 
-we are using [Keycloak](https://www.keycloak.org/). Check official [docs](https://www.keycloak.org/guides#getting-started) for setup. 
+The terminology server requires authenticated users. Any authentication server supporting Open-Id connect should suffice. For our development,
+we are using [Keycloak](https://www.keycloak.org/). Check official [docs](https://www.keycloak.org/guides#getting-started) for setup.
 Check the [example](https://wiki.kodality.dev/terminology-server/guide/authentication#keycloak) of the configuration.
 
 ### Run application with authentication
-```bash 
+```bash
 ./gradlew run
 ```
 
-## Snowstorm 
-Snowstorm server serves SNOMED terminology and may be installed if you need SNOMED. 
+## Snowstorm
+Snowstorm server serves SNOMED terminology and may be installed if you need SNOMED.
 Check Snowstorm installation and configuration [documentation](https://wiki.kodality.dev/terminology-server/snowstorm).
 
 After installation add properties `snowstorm.url`, `snowstorm.user`, `snowstorm.password`, `snowstorm.namespace` to `application.yml` file.
