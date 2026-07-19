@@ -8,6 +8,14 @@ ENV APP_VERSION=${APP_VERSION:-latest}
 ARG BUILD_TIME
 ENV BUILD_TIME=$BUILD_TIME
 
+# The entrypoint imports operator-provided CA certificates from /certs into the
+# JVM truststore before handing off to CMD. It MUST land at /entrypoint.sh —
+# the ENTRYPOINT directive below references it by absolute path, and a missing
+# file makes the container un-startable (runc fails during container init).
+# The CI smoke test in build.yml guards this invariant.
+ADD entrypoint.sh /
+RUN mkdir /certs
+
 # Short commit sha and the merged PR number, surfaced on /info so a running
 # container can be traced back to an exact build (version is just the image tag,
 # e.g. "latest", which isn't enough on dev).
@@ -16,16 +24,14 @@ ENV GIT_COMMIT=$GIT_COMMIT
 ARG PR_NUMBER
 ENV PR_NUMBER=$PR_NUMBER
 
-# Fail-fast on OutOfMemoryError instead of letting the JVM limp on with
-# a depleted heap. The previous behaviour (no flag) caused the May 2026
-# dev-server incident where a single OOM cascaded into every concurrent
-# request, the Netty selector, AND the SnomedImportPollingService — all
-# died with their own OOMs over several minutes while the container
-# kept running. ExitOnOutOfMemoryError makes the JVM exit immediately;
-# Docker's `restart: unless-stopped` brings it back clean within seconds.
-# HeapDumpOnOutOfMemoryError + HeapDumpPath leave a postmortem .hprof so
-# the next incident can be diagnosed without re-OOMing dev-server to
-# capture a heap dump live.
+# Fail-fast on OutOfMemoryError instead of letting the JVM limp on with a depleted
+# heap. Without this, a single OOM cascades into every concurrent request, the
+# Netty selector, and unrelated scheduled tasks — all die with their own OOMs
+# over several minutes while the container keeps running and never restarts.
+# ExitOnOutOfMemoryError makes the JVM exit immediately; Docker's restart policy
+# brings it back clean within seconds. HeapDumpOnOutOfMemoryError leaves a
+# postmortem .hprof in /app/logs (volume-mounted in production) so the next
+# incident can be diagnosed without re-OOMing the container to capture a dump.
 #
 # /app/logs is the standard volume-mount path the deploy compose files
 # already export to /opt/.../logs on the host, so dumps survive container
@@ -47,3 +53,4 @@ ENV JVM_OOM_OPTS="-XX:+ExitOnOutOfMemoryError -XX:+HeapDumpOnOutOfMemoryError -X
 
 COPY build/libs/*-all.jar terminology.jar
 CMD java ${JVM_OOM_OPTS} ${JAVA_OPTS} -jar terminology.jar
+ENTRYPOINT ["/entrypoint.sh"]
