@@ -10,7 +10,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: termx-server
+  IMAGE_NAME: lmb-termx-server
 
 defaults:
   run:
@@ -46,7 +46,7 @@ jobs:
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      
+
       - name: Verify vendored code in final JAR
         working-directory: .
         run: |
@@ -54,7 +54,7 @@ jobs:
           TERMX_JAR=$(ls termx-app/build/libs/termx-app-*-all.jar)
           echo "Checking: $TERMX_JAR"
           echo ""
-          
+
           echo "=== Verifying PgBeanProcessor ==="
           if jar -tf "$TERMX_JAR" | grep -q "com/kodality/commons/db/bean/PgBeanProcessor.class"; then
             echo "✅ PgBeanProcessor found"
@@ -62,7 +62,7 @@ jobs:
             echo "❌ ERROR: PgBeanProcessor not found!"
             exit 1
           fi
-          
+
           echo "=== Verifying NO duplicate BeanProcessor classes ==="
           BEAN_COUNT=$(jar -tf "$TERMX_JAR" | grep -c "org/apache/commons/dbutils/BeanProcessor.class" || true)
           if [ "$BEAN_COUNT" -eq "1" ]; then
@@ -71,7 +71,7 @@ jobs:
             echo "❌ ERROR: Found $BEAN_COUNT BeanProcessor.class files (expected 1)!"
             exit 1
           fi
-          
+
           echo "=== Verifying NO duplicate GenerousBeanProcessor classes ==="
           GENEROUS_COUNT=$(jar -tf "$TERMX_JAR" | grep -c "org/apache/commons/dbutils/GenerousBeanProcessor.class" || true)
           if [ "$GENEROUS_COUNT" -eq "1" ]; then
@@ -80,7 +80,7 @@ jobs:
             echo "❌ ERROR: Found $GENEROUS_COUNT GenerousBeanProcessor.class files (expected 1)!"
             exit 1
           fi
-          
+
           echo "=== Verifying ColumnHandler exists ==="
           if jar -tf "$TERMX_JAR" | grep -q "org/apache/commons/dbutils/ColumnHandler.class"; then
             echo "✅ ColumnHandler.class found"
@@ -88,7 +88,7 @@ jobs:
             echo "❌ ERROR: ColumnHandler.class not found!"
             exit 1
           fi
-          
+
           echo ""
           echo "✅ All vendored code verified successfully - NO duplicates, all required classes present!"
 
@@ -133,10 +133,32 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
           tags: |
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}         
+            type=semver,pattern={{major}}.{{minor}}
             type=raw,value=${{ env.LATEST_TAG }}
           flavor: |
             latest=false
+
+      # Gate publication on the image actually being able to start. The 2026-07-06
+      # build shipped ENTRYPOINT ["/entrypoint.sh"] without the file (lost in an
+      # upstream rebase-sync), so every consumer of :latest got a container that
+      # died in runc before the JVM ran a single instruction. Build the amd64
+      # image into the local daemon and exec through the real entrypoint chain;
+      # a dangling ENTRYPOINT path fails here instead of on customer hosts.
+      - name: Build image for smoke test (amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./termx-app
+          platforms: linux/amd64
+          load: true
+          tags: smoke-test:local
+
+      - name: Smoke test entrypoint
+        working-directory: .
+        run: |
+          echo "=== Declared entrypoint file must exist and be executable ==="
+          docker run --rm --entrypoint /bin/sh smoke-test:local -c 'test -x /entrypoint.sh'
+          echo "=== Container init must reach CMD through the entrypoint ==="
+          docker run --rm smoke-test:local /bin/sh -c 'echo entrypoint-chain-ok'
 
       - name: Build and push
         uses: docker/build-push-action@v6
