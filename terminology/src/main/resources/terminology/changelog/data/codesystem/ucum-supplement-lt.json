@@ -1418,5 +1418,95 @@
           },
           "value" : "k[arb'U]/l"
         }]
+    },
+    {
+      "code" : "%{vol}",
+      "display" : "VolumePercent",
+      "designation" : [{
+        "language" : "lt",
+        "use" : {
+          "code" : "display"
+        },
+        "value" : "Tūrio procentas"
+      },
+        {
+          "language" : "lt",
+          "use" : {
+            "code" : "alias"
+          },
+          "value" : "vol%"
+        }]
+    },
+    {
+      "code" : "[CFU]/g",
+      "display" : "ColonyFormingUnitsPerGram",
+      "designation" : [{
+        "language" : "lt",
+        "use" : {
+          "code" : "display"
+        },
+        "value" : "Koloniją formuojantys vienetai grame"
+      },
+        {
+          "language" : "lt",
+          "use" : {
+            "code" : "alias"
+          },
+          "value" : "KFV/g"
+        }]
+    },
+    {
+      "code" : "g/mmol{creat}",
+      "display" : "GramsPerMillimoleCreatinine",
+      "designation" : [{
+        "language" : "lt",
+        "use" : {
+          "code" : "display"
+        },
+        "value" : "Gramai milimolyje kreatinino"
+      },
+        {
+          "language" : "lt",
+          "use" : {
+            "code" : "alias"
+          },
+          "value" : "g/mmol Kreatinino"
+        }]
+    },
+    {
+      "code" : "10*11",
+      "display" : "HundredBillion",
+      "designation" : [{
+        "language" : "lt",
+        "use" : {
+          "code" : "display"
+        },
+        "value" : "Šimtas milijardų"
+      },
+        {
+          "language" : "lt",
+          "use" : {
+            "code" : "alias"
+          },
+          "value" : "10^11"
+        }]
+    },
+    {
+      "code" : "mg/mmol{creat}",
+      "display" : "MilligramsPerMillimoleCreatinine",
+      "designation" : [{
+        "language" : "lt",
+        "use" : {
+          "code" : "display"
+        },
+        "value" : "Miligramai milimolyje kreatinino"
+      },
+        {
+          "language" : "lt",
+          "use" : {
+            "code" : "alias"
+          },
+          "value" : "mg/mmol Kreatinino"
+        }]
     }]
 }
