@@ -56,6 +56,16 @@
     </customChange>
   </changeSet>
 
+  <!-- runOnChange: load the Lithuanian UCUM supplement and re-import it whenever the JSON changes, so added
+       units/designations propagate to already-migrated databases — same contract as ucum-supplement-ee above.
+       Until now ucum-lt.json was present in the repo but wired to no changeset, so it was imported by hand and
+       drifted out of sync between environments. Wiring it here loads it on fresh installs and keeps it current. -->
+  <changeSet id="ucum-supplement-lt" author="termx" runOnChange="true">
+    <customChange class="org.termx.terminology.liquibase.CodeSystemFhirImport">
+      <param name="files" value="terminology/changelog/data/codesystem/ucum-supplement-lt.json"/>
+    </customChange>
+  </changeSet>
+
   <!-- The ucum-ee CodeSystem/ValueSet canonicals were renamed (-> https://fhir.ee/{CodeSystem,ValueSet}/ucum)
        in the JSON, but CodeSystemFhirImport/ValueSetFhirImport match an existing resource by id and preserve
        its stored uri, so the rename does not propagate to already-migrated databases on re-import. Apply it
