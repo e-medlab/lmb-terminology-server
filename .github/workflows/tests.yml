@@ -39,11 +39,20 @@ jobs:
       # `test` rather than `check`: PMD/SpotBugs stay on the weekly + release runs so a
       # style finding never blocks a PR, while a genuine test regression always does.
       # GITHUB_ACTOR/GITHUB_TOKEN authenticate the com.kodality.* GitHub Packages deps.
+      #
+      # GUEST_DISABLED=false restores the UPSTREAM default. This fork ships
+      # `auth.guest.disabled: ${GUEST_DISABLED:true}` — a deployment choice for LMB, not a
+      # behaviour under test — and the integration suite inherited from upstream calls
+      # unauthenticated endpoints. ConformanceStartupOrderingTest hits GET /fhir/metadata
+      # with no credentials, so with guest off it gets rejected and fails on a config
+      # difference rather than on anything the code does. Pinning the upstream default here
+      # keeps this gate measuring code, and keeps its results comparable to upstream CI.
       - name: Run tests
         run: ./gradlew test
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GUEST_DISABLED: "false"
 
       # The Gradle console only summarises failures; publish the reports so a red PR can
       # be diagnosed without re-running the suite locally.
