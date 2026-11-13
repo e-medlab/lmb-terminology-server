@@ -484,6 +484,86 @@ d1,D1,active"""
    * - CodeSystem metadata (id, uri, publisher, name, title, OID) is correctly mapped
    * - CodeSystemVersion metadata (version number, release date, algorithm, supported languages) is correctly mapped
    */
+  /**
+   * BUSINESS: an import into an existing supplement keeps it a supplement (LMB: ucum-lt, a
+   * supplement of UCUM set in the metadata, came back as complete with no base after importing
+   * version 4, because the import form for an existing code system names no base).
+   */
+  def "an import that names no base keeps an existing code system's content and base"() {
+    given:
+    def request = supplementRequest(null)
+    def existing = new CodeSystem(id: "ucum-lt", content: "supplement", baseCodeSystem: "ucum",
+        baseCodeSystemUri: "http://unitsofmeasure.org")
+
+    when:
+    CodeSystem codeSystem = CodeSystemFileImportMapper.toCodeSystem(
+      request.codeSystem, request.version, CodeSystemFileImportProcessor.process(request, csv()), existing, null)
+
+    then:
+    codeSystem.content == "supplement"
+    codeSystem.baseCodeSystem == "ucum"
+    codeSystem.baseCodeSystemUri == "http://unitsofmeasure.org"
+    codeSystem.hierarchyMeaning == null
+  }
+
+  def "a new code system that names no base is complete"() {
+    given:
+    def request = supplementRequest(null)
+
+    when:
+    CodeSystem codeSystem = CodeSystemFileImportMapper.toCodeSystem(
+      request.codeSystem, request.version, CodeSystemFileImportProcessor.process(request, csv()), null, null)
+
+    then:
+    codeSystem.content == "complete"
+    codeSystem.baseCodeSystem == null
+  }
+
+  def "an import that names a base makes the code system a supplement of it"() {
+    given:
+    def request = supplementRequest("ucum")
+    def existing = new CodeSystem(id: "ucum-lt", content: "complete")
+
+    when:
+    CodeSystem codeSystem = CodeSystemFileImportMapper.toCodeSystem(
+      request.codeSystem, request.version, CodeSystemFileImportProcessor.process(request, csv()), existing, null)
+
+    then:
+    codeSystem.content == "supplement"
+    codeSystem.baseCodeSystem == "ucum"
+  }
+
+  def "an existing complete code system stays complete"() {
+    given:
+    def request = supplementRequest(null)
+    def existing = new CodeSystem(id: "ucum-lt", content: "complete")
+
+    when:
+    CodeSystem codeSystem = CodeSystemFileImportMapper.toCodeSystem(
+      request.codeSystem, request.version, CodeSystemFileImportProcessor.process(request, csv()), existing, null)
+
+    then:
+    codeSystem.content == "complete"
+    codeSystem.baseCodeSystem == null
+  }
+
+  private static byte[] csv() {
+    return """code,display#lt
+mg,miligramas""".getBytes("UTF-8")
+  }
+
+  private static CodeSystemFileImportRequest supplementRequest(String base) {
+    return new CodeSystemFileImportRequest(
+      type: "csv",
+      codeSystem: new FileProcessingCodeSystem(id: "ucum-lt", uri: "https://lmb.example/CodeSystem/ucum-lt", supplement: base),
+      version: new FileProcessingCodeSystemVersion(number: "4", language: "lt"),
+      properties: [
+        new FileProcessingProperty(columnName: "code", propertyName: "concept-code", propertyType: "string", preferred: true),
+        new FileProcessingProperty(columnName: "display#lt", propertyName: "display", propertyType: "designation", language: "lt")
+      ]
+    )
+  }
+
   def "should map CodeSystem and version metadata"() {
     given: "CSV file with minimal data and full CodeSystem metadata"
     String csvContent = """code,display#en

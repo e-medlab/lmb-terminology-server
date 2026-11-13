@@ -94,9 +94,22 @@ public class CodeSystemFileImportMapper {
     codeSystem.setConcepts(result.getEntities().stream().map(e -> toCsConcept(codeSystem.getId(), e, result.getEntities())).toList());
     log.debug("MAPPER DEBUG: Mapped {} concepts", codeSystem.getConcepts().size());
     
-    codeSystem.setContent(fpCodeSystem.getSupplement() != null || fpCodeSystem.getSupplementUri() != null ? CodeSystemContent.supplement : CodeSystemContent.complete);
-    codeSystem.setBaseCodeSystem(fpCodeSystem.getSupplement());
-    codeSystem.setBaseCodeSystemUri(fpCodeSystem.getSupplementUri());
+    // An import that names a base code system makes this a supplement of it. One that names none
+    // leaves an EXISTING code system's content and base as they are: the import form for an
+    // existing code system does not carry them, so deriving them from the request turned a
+    // supplement set up in the metadata (ucum-lt, a supplement of UCUM) back into a complete code
+    // system with no base on every import of a new version. Only a new code system, or one with no
+    // content yet, defaults to complete.
+    boolean supplementRequested = fpCodeSystem.getSupplement() != null || fpCodeSystem.getSupplementUri() != null;
+    if (supplementRequested) {
+      codeSystem.setContent(CodeSystemContent.supplement);
+      codeSystem.setBaseCodeSystem(fpCodeSystem.getSupplement());
+      codeSystem.setBaseCodeSystemUri(fpCodeSystem.getSupplementUri());
+    } else if (existingCodeSystem == null || codeSystem.getContent() == null) {
+      codeSystem.setContent(CodeSystemContent.complete);
+      codeSystem.setBaseCodeSystem(null);
+      codeSystem.setBaseCodeSystemUri(null);
+    }
     codeSystem.setExternalWebSource(fpCodeSystem.getExternalWebSource());
     codeSystem.setHierarchyMeaning(CodeSystemContent.supplement.equals(codeSystem.getContent()) ? null : toHierarchyMeaning(result.getProperties()).orElse(null));
     codeSystem.setContacts(CollectionUtils.isNotEmpty(fpCodeSystem.getContact()) ? toContacts(fpCodeSystem.getContact()) : codeSystem.getContacts());
