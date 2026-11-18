@@ -159,6 +159,9 @@ jobs:
           docker run --rm --entrypoint /bin/sh smoke-test:local -c 'test -x /entrypoint.sh'
           echo "=== Container init must reach CMD through the entrypoint ==="
           docker run --rm smoke-test:local /bin/sh -c 'echo entrypoint-chain-ok'
+          echo "=== CVE-2026-114938 workaround: Base64 intrinsic must be off ==="
+          docker run --rm --entrypoint /bin/sh smoke-test:local -c 'java -XX:+PrintFlagsFinal -version 2>/dev/null' \
+            | grep -E 'UseBASE64Intrinsics +=  *false'
 
       - name: Build and push
         uses: docker/build-push-action@v6
