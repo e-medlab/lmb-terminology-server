@@ -1,5 +1,14 @@
 FROM eclipse-temurin:25-jre
 
+# WORKAROUND for CVE-2026-114938 (Java4Shell), not the fix: HotSpot's AVX-512 VBMI Base64 decode
+# intrinsic overflows on x86-64 Ice Lake+/Zen 4+, and OAuthSessionProvider runs JWT.decode
+# (java-jwt -> Base64.getUrlDecoder) on any bearer token before verifying it. JAVA_TOOL_OPTIONS
+# is read by the JVM itself, so JVM_OOM_OPTS / JAVA_OPTS in CMD are unaffected, and the
+# entrypoint's keytool picks it up harmlessly. A deployment that sets its own JAVA_TOOL_OPTIONS
+# must keep the flag. Remove once a fixed Temurin 25 is pinned. Fork-only divergence from
+# upstream termx-server (like the entrypoint lines below) — verify it survives every sync.
+ENV JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:+$JAVA_TOOL_OPTIONS }-XX:-UseBASE64Intrinsics"
+
 RUN apt-get update && apt-get install -y curl
 
 ARG APP_VERSION
